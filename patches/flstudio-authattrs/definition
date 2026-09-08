@@ -1,0 +1,4 @@
+Fixes: crypt32: Verify authenticated attributes in their original encoded order.
+
+# FL Studio 26.1.5 is one affected application, but the fix is generic and
+# contains no application, publisher, certificate, or file-hash allowlist.

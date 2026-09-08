@@ -1,0 +1,363 @@
+@page {
+  size: A4;
+  margin: 19mm 18mm 20mm 18mm;
+
+  @bottom-left {
+    content: "Wine DAW Compatibility Patches";
+    color: #647184;
+    font-family: "Noto Sans", sans-serif;
+    font-size: 8pt;
+  }
+
+  @bottom-right {
+    content: "Page " counter(page) " of " counter(pages);
+    color: #647184;
+    font-family: "Noto Sans", sans-serif;
+    font-size: 8pt;
+  }
+}
+
+@page:first {
+  margin: 0;
+
+  @bottom-left {
+    content: none;
+  }
+
+  @bottom-right {
+    content: none;
+  }
+}
+
+:root {
+  color: #172033;
+  font-family: "Noto Sans", "DejaVu Sans", sans-serif;
+  font-size: 9.35pt;
+  line-height: 1.48;
+}
+
+html {
+  background: #ffffff;
+}
+
+body {
+  margin: 0;
+  background: #ffffff;
+  color: #172033;
+  font-variant-numeric: tabular-nums;
+  hyphens: auto;
+}
+
+header#title-block-header {
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: 297mm;
+  padding: 30mm 27mm 32mm;
+  color: #ffffff;
+  background:
+    linear-gradient(140deg, rgba(16, 31, 55, 0.97), rgba(15, 91, 107, 0.94)),
+    linear-gradient(30deg, #111b2e, #167589);
+  page-break-after: always;
+  position: relative;
+}
+
+header#title-block-header::before {
+  content: "TECHNICAL REFERENCE";
+  display: block;
+  width: 48mm;
+  margin-bottom: 18mm;
+  padding: 2.5mm 4mm;
+  border: 0.35mm solid rgba(255, 255, 255, 0.48);
+  border-radius: 1.5mm;
+  color: #bff5ed;
+  font-size: 8.5pt;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+}
+
+header#title-block-header::after {
+  content: "crypt32 authenticated-attribute compatibility  •  win32u client-surface ordering";
+  display: block;
+  margin-top: 27mm;
+  color: rgba(255, 255, 255, 0.72);
+  font-family: "DejaVu Sans Mono", monospace;
+  font-size: 8pt;
+  line-height: 1.6;
+}
+
+h1.title {
+  max-width: 145mm;
+  margin: 0 0 6mm;
+  padding: 0;
+  border: 0;
+  color: #ffffff;
+  font-size: 30pt;
+  font-weight: 800;
+  line-height: 1.06;
+  letter-spacing: -0.025em;
+}
+
+p.subtitle {
+  max-width: 145mm;
+  margin: 0 0 14mm;
+  color: #bff5ed;
+  font-size: 15pt;
+  font-weight: 500;
+  line-height: 1.35;
+}
+
+p.author,
+p.date {
+  margin: 1.5mm 0 0;
+  color: rgba(255, 255, 255, 0.83);
+  font-size: 9.5pt;
+}
+
+nav#TOC {
+  page-break-after: always;
+  padding-top: 3mm;
+}
+
+nav#TOC::before {
+  content: "CONTENTS";
+  display: block;
+  margin-bottom: 6mm;
+  color: #0d6b75;
+  font-size: 8.5pt;
+  font-weight: 800;
+  letter-spacing: 0.18em;
+}
+
+nav#TOC > ul {
+  padding-left: 0;
+}
+
+nav#TOC ul {
+  list-style: none;
+}
+
+nav#TOC li {
+  margin: 1.8mm 0;
+  break-inside: avoid;
+}
+
+nav#TOC li li {
+  margin: 1mm 0;
+}
+
+nav#TOC a {
+  color: #172033;
+  text-decoration: none;
+}
+
+nav#TOC > ul > li > a {
+  color: #0b5661;
+  font-size: 10.5pt;
+  font-weight: 700;
+}
+
+nav#TOC ul ul {
+  margin: 1.2mm 0 2mm 4mm;
+  padding-left: 4mm;
+  border-left: 0.5mm solid #d4e4e7;
+  font-size: 8.7pt;
+}
+
+nav#TOC ul ul ul {
+  display: none;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  color: #102f4b;
+  font-weight: 700;
+  line-height: 1.2;
+  page-break-after: avoid;
+  break-after: avoid-page;
+}
+
+h1 {
+  margin: 8mm 0 4.5mm;
+  padding-bottom: 2.4mm;
+  border-bottom: 0.7mm solid #25a09b;
+  font-size: 20pt;
+  letter-spacing: -0.015em;
+}
+
+h1:not(:first-of-type) {
+  page-break-before: always;
+}
+
+h2 {
+  margin: 6.5mm 0 3mm;
+  color: #0d6772;
+  font-size: 14.5pt;
+}
+
+h3 {
+  margin: 5mm 0 2mm;
+  font-size: 11.5pt;
+}
+
+h4 {
+  margin: 4mm 0 1.5mm;
+  font-size: 10pt;
+}
+
+p {
+  margin: 0 0 3.1mm;
+  orphans: 3;
+  widows: 3;
+}
+
+strong {
+  color: #102f4b;
+}
+
+a {
+  color: #087682;
+  text-decoration: underline;
+  text-decoration-color: #76b8be;
+  text-decoration-thickness: 0.2mm;
+}
+
+ul,
+ol {
+  margin: 1.5mm 0 3.5mm;
+  padding-left: 6.5mm;
+}
+
+li {
+  margin: 1.1mm 0;
+  padding-left: 1mm;
+}
+
+li::marker {
+  color: #14848a;
+  font-weight: 700;
+}
+
+blockquote {
+  box-sizing: border-box;
+  margin: 5mm 0;
+  padding: 4mm 5mm;
+  border: 0;
+  border-left: 1.4mm solid #1a9a98;
+  border-radius: 0 2mm 2mm 0;
+  background: #edf8f7;
+  color: #173c46;
+  break-inside: avoid;
+}
+
+blockquote p:last-child {
+  margin-bottom: 0;
+}
+
+blockquote strong:first-child {
+  color: #087078;
+}
+
+code {
+  padding: 0.15mm 0.7mm;
+  border-radius: 0.7mm;
+  background: #edf1f5;
+  color: #7a2347;
+  font-family: "DejaVu Sans Mono", "Noto Sans Mono", monospace;
+  font-size: 0.88em;
+  overflow-wrap: anywhere;
+}
+
+pre {
+  box-sizing: border-box;
+  margin: 4mm 0;
+  padding: 4mm 4.5mm;
+  border-left: 1.2mm solid #4d91a5;
+  border-radius: 1.2mm;
+  background: #132338;
+  color: #ecf4f6;
+  font-family: "DejaVu Sans Mono", "Noto Sans Mono", monospace;
+  font-size: 7.7pt;
+  line-height: 1.42;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  break-inside: avoid;
+}
+
+pre code {
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  font-size: inherit;
+}
+
+table {
+  width: 100%;
+  margin: 4.5mm 0 5.5mm;
+  border-collapse: collapse;
+  font-size: 8.15pt;
+  line-height: 1.38;
+  break-inside: auto;
+}
+
+thead {
+  display: table-header-group;
+}
+
+tr {
+  break-inside: avoid;
+}
+
+th {
+  padding: 2.5mm 2.2mm;
+  border: 0.25mm solid #9fb8c2;
+  background: #163f56;
+  color: #ffffff;
+  font-weight: 700;
+  text-align: left;
+  vertical-align: bottom;
+}
+
+td {
+  padding: 2.3mm 2.2mm;
+  border: 0.25mm solid #c7d5dc;
+  vertical-align: top;
+}
+
+tbody tr:nth-child(even) {
+  background: #f4f8fa;
+}
+
+table code {
+  font-size: 0.84em;
+}
+
+hr {
+  margin: 8mm 0;
+  border: 0;
+  border-top: 0.4mm solid #cad8df;
+}
+
+body > h1:first-of-type {
+  margin-top: 0;
+}
+
+@media screen {
+  html {
+    background: #eef2f6;
+  }
+
+  body {
+    max-width: 174mm;
+    margin: 12mm auto;
+    padding: 16mm 18mm;
+    box-shadow: 0 3mm 12mm rgba(23, 32, 51, 0.14);
+  }
+
+  header#title-block-header {
+    margin: -16mm -18mm 16mm;
+  }
+}

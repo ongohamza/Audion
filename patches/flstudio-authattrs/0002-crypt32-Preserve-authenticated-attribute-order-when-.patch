@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ongohamza <hkhamzash773@gmail.com>
+Date: Mon, 31 Aug 2026 22:02:43 -0700
+Subject: [PATCH 2/2] crypt32: Preserve authenticated attribute order when
+ verifying
+
+
+diff --git a/dlls/crypt32/msg.c b/dlls/crypt32/msg.c
+index fafa404..ee3dbd3 100644
+--- a/dlls/crypt32/msg.c
++++ b/dlls/crypt32/msg.c
+@@ -1103,6 +1103,59 @@ typedef enum {
+     Verify
+ } SignOrVerify;
+ 
++/* Windows verifies authenticated attributes in their encoded order, even when
++ * the SET is not DER-sorted. */
++static BOOL encode_attributes_in_order(const CRYPT_ATTRIBUTES *attributes,
++ BYTE **encoded, DWORD *size)
++{
++    DWORD i, data_size = 0, len_size, attr_size, remaining;
++    BYTE *ptr;
++
++    *encoded = NULL;
++    for (i = 0; i < attributes->cAttr; ++i)
++    {
++        attr_size = 0;
++        if (!CryptEncodeObjectEx(X509_ASN_ENCODING, PKCS_ATTRIBUTE,
++            &attributes->rgAttr[i], 0, NULL, NULL, &attr_size))
++            return FALSE;
++        if (attr_size > ~data_size)
++        {
++            SetLastError(CRYPT_E_ASN1_LARGE);
++            return FALSE;
++        }
++        data_size += attr_size;
++    }
++
++    CRYPT_EncodeLen(data_size, NULL, &len_size);
++    if (data_size > ~(len_size + 1))
++    {
++        SetLastError(CRYPT_E_ASN1_LARGE);
++        return FALSE;
++    }
++    *size = 1 + len_size + data_size;
++    if (!(*encoded = LocalAlloc(0, *size))) return FALSE;
++
++    ptr = *encoded;
++    *ptr++ = ASN_CONSTRUCTOR | ASN_SETOF;
++    CRYPT_EncodeLen(data_size, ptr, &len_size);
++    ptr += len_size;
++    remaining = data_size;
++    for (i = 0; i < attributes->cAttr; ++i)
++    {
++        attr_size = remaining;
++        if (!CryptEncodeObjectEx(X509_ASN_ENCODING, PKCS_ATTRIBUTE,
++            &attributes->rgAttr[i], 0, NULL, ptr, &attr_size))
++        {
++            LocalFree(*encoded);
++            *encoded = NULL;
++            return FALSE;
++        }
++        ptr += attr_size;
++        remaining -= attr_size;
++    }
++    return TRUE;
++}
++
+ static BOOL CSignedMsgData_UpdateAuthenticatedAttributes(
+  CSignedMsgData *msg_data, SignOrVerify flag)
+ {
+@@ -1136,9 +1189,15 @@ static BOOL CSignedMsgData_UpdateAuthenticatedAttributes(
+                 LPBYTE encodedAttrs;
+                 DWORD size;
+ 
+-                ret = CryptEncodeObjectEx(X509_ASN_ENCODING, PKCS_ATTRIBUTES,
+-                 &msg_data->info->rgSignerInfo[i].AuthAttrs,
+-                 CRYPT_ENCODE_ALLOC_FLAG, NULL, &encodedAttrs, &size);
++                if (flag == Verify)
++                    ret = encode_attributes_in_order(
++                     &msg_data->info->rgSignerInfo[i].AuthAttrs,
++                     &encodedAttrs, &size);
++                else
++                    ret = CryptEncodeObjectEx(X509_ASN_ENCODING,
++                     PKCS_ATTRIBUTES,
++                     &msg_data->info->rgSignerInfo[i].AuthAttrs,
++                     CRYPT_ENCODE_ALLOC_FLAG, NULL, &encodedAttrs, &size);
+                 if (ret)
+                 {
+                     ret = CryptHashData(
+-- 
+2.55.0
+
