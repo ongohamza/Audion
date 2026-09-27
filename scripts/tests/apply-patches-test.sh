@@ -44,8 +44,9 @@ GIT_COMMITTER_NAME="Audion integration test" \
 GIT_COMMITTER_EMAIL="audion-test@example.invalid" \
     "$project_dir/scripts/apply-patches.sh" "$test_tree"
 
-mapfile -t subjects < <(git -C "$test_tree" log -3 --format=%s)
+mapfile -t subjects < <(git -C "$test_tree" log -4 --format=%s)
 expected=(
+    "gdi32: Add opt-in protection against malformed DeleteObject aliases"
     "win32u: Re-present offscreen client surfaces after window flushes"
     "crypt32: Preserve authenticated attribute order when verifying"
     "crypt32/tests: Test signatures with unsorted authenticated attributes"
@@ -68,4 +69,4 @@ done
 
 printf 'Applied patch subjects (newest first):\n'
 printf '  %s\n' "${subjects[@]}"
-echo "PASS: Audion applies the complete three-patch stack in order"
+echo "PASS: Audion applies the complete four-patch stack in order"

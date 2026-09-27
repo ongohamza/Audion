@@ -16,6 +16,7 @@ patches=(
     "$project_dir/patches/flstudio-authattrs/0001-crypt32-tests-Test-signatures-with-unsorted-authenti.patch"
     "$project_dir/patches/flstudio-authattrs/0002-crypt32-Preserve-authenticated-attribute-order-when-.patch"
     "$project_dir/patches/opengl-flicker/0001-win32u-Re-present-offscreen-client-surfaces-after-wi.patch"
+    "$project_dir/patches/effectrix-crash/0001-gdi32-Add-opt-in-protection-against-malformed-Delete.patch"
 )
 
 # shellcheck source=../manifests/wine-11.16.env

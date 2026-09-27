@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ongohamza <hkhamzash773@gmail.com>
+Date: Wed, 2 Sep 2026 05:08:03 -0700
+Subject: [PATCH] win32u: Re-present offscreen client surfaces after window
+ flushes
+
+---
+ dlls/win32u/dce.c            | 24 ++++++++++++++++++++++--
+ dlls/win32u/win32u_private.h |  1 +
+ dlls/win32u/window.c         | 23 +++++++++++++++++++++++
+ 3 files changed, 46 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/win32u/dce.c b/dlls/win32u/dce.c
+index 5e8d82a..845c89d 100644
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -115,6 +115,8 @@ static const struct window_surface_funcs offscreen_window_surface_funcs =
+     .destroy = offscreen_window_surface_destroy
+ };
+ 
++static BOOL window_surface_flush_internal( struct window_surface *surface, RECT *flushed_rect );
++
+ static void create_offscreen_window_surface( HWND hwnd, const RECT *surface_rect, struct window_surface **window_surface )
+ {
+     char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
+@@ -206,7 +208,7 @@ static BOOL scaled_surface_flush( struct window_surface *window_surface, const R
+                                     window_surface->alpha_bits, window_surface->alpha_mask );
+     }
+ 
+-    window_surface_flush( surface->target_surface );
++    window_surface_flush_internal( surface->target_surface, NULL );
+     return TRUE;
+ }
+ 
+@@ -610,7 +612,7 @@ void window_surface_unlock( struct window_surface *surface )
+     pthread_mutex_unlock( &surface->mutex );
+ }
+ 
+-void window_surface_flush( struct window_surface *surface )
++static BOOL window_surface_flush_internal( struct window_surface *surface, RECT *flushed_rect )
+ {
+     char color_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
+     char shape_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
+@@ -618,6 +620,7 @@ void window_surface_flush( struct window_surface *surface )
+     BITMAPINFO *shape_info = (BITMAPINFO *)shape_buf;
+     RECT dirty = surface->rect, bounds;
+     void *color_bits;
++    BOOL flushed = FALSE;
+ 
+     window_surface_lock( surface );
+ 
+@@ -639,10 +642,27 @@ void window_surface_flush( struct window_surface *surface )
+ 
+         if (surface->funcs->flush( surface, &surface->rect, &dirty, color_info, color_bits,
+                                    shape_changed, shape_info, shape_bits ))
++        {
+             reset_bounds( &surface->bounds );
++            flushed = TRUE;
++            if (flushed_rect)
++            {
++                *flushed_rect = dirty;
++                OffsetRect( flushed_rect, surface->rect.left, surface->rect.top );
++            }
++        }
+     }
+ 
+     window_surface_unlock( surface );
++    return flushed;
++}
++
++void window_surface_flush( struct window_surface *surface )
++{
++    RECT flushed_rect;
++
++    if (window_surface_flush_internal( surface, &flushed_rect ))
++        present_client_surfaces( surface->hwnd, &flushed_rect );
+ }
+ 
+ void window_surface_set_layered( struct window_surface *surface, COLORREF color_key, UINT alpha_bits, UINT alpha_mask )
+diff --git a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+index 03f37ca..40f7901 100644
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -324,6 +324,7 @@ extern HWND get_shell_window(void);
+ extern HWND get_progman_window(void);
+ extern HWND get_taskman_window(void);
+ extern BOOL is_client_surface_window( struct client_surface *surface, HWND hwnd );
++extern void present_client_surfaces( HWND hwnd, const RECT *rect );
+ extern void client_surface_update( struct client_surface *surface );
+ extern BOOL client_surface_get_size( struct client_surface *surface, SIZE *virtual_size, SIZE *monitor_size );
+ extern void use_window_client_surface( struct client_surface *surface, BOOL use );
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index 7c1f37b..2cc6df9 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -436,6 +436,29 @@ void client_surface_present( struct client_surface *surface )
+     pthread_mutex_unlock( &surfaces_lock );
+ }
+ 
++void present_client_surfaces( HWND hwnd, const RECT *rect )
++{
++    struct client_surface *surface;
++    RECT intersect;
++    HDC hdc;
++
++    pthread_mutex_lock( &surfaces_lock );
++
++    LIST_FOR_EACH_ENTRY( surface, &client_surfaces, struct client_surface, entry )
++    {
++        if (surface->toplevel != hwnd || !InterlockedCompareExchange( &surface->offscreen, 0, 0 )) continue;
++        if (!intersect_rect( &intersect, &surface->virtual_rect, rect )) continue;
++        if (!(hdc = NtUserGetDCEx( surface->hwnd, 0, DCX_CACHE | DCX_USESTYLE ))) continue;
++
++        TRACE( "presenting overlapping %s after toplevel %p flush %s\n",
++               debugstr_client_surface( surface ), hwnd, wine_dbgstr_rect( rect ) );
++        surface->funcs->present( surface, hdc );
++        NtUserReleaseDC( surface->hwnd, hdc );
++    }
++
++    pthread_mutex_unlock( &surfaces_lock );
++}
++
+ void client_surface_update( struct client_surface *surface )
+ {
+     pthread_mutex_lock( &surfaces_lock );
+-- 
+2.55.0

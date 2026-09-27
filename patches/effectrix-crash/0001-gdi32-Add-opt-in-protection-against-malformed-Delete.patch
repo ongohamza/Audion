@@ -1,0 +1,52 @@
+From c36d88865d5398d686c5583c3cc039b55575ec90 Mon Sep 17 00:00:00 2001
+From: ongohamza <hkhamzash773@gmail.com>
+Date: Fri, 25 Sep 2026 00:38:53 -0700
+Subject: [PATCH] gdi32: Add opt-in protection against malformed DeleteObject
+ aliases
+
+---
+ dlls/gdi32/objects.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/dlls/gdi32/objects.c b/dlls/gdi32/objects.c
+index f2b353c..a8a7930 100644
+--- a/dlls/gdi32/objects.c
++++ b/dlls/gdi32/objects.c
+@@ -57,6 +57,7 @@ struct obj_map_entry
+ };
+ 
+ static CRITICAL_SECTION obj_map_cs;
++static BOOL strict_delete_object;
+ static CRITICAL_SECTION_DEBUG obj_map_debug =
+ {
+     0, 0, &obj_map_cs,
+@@ -137,10 +138,14 @@ HGDIOBJ get_full_gdi_handle( HGDIOBJ obj )
+  */
+ BOOL WINAPI DllMain( HINSTANCE inst, DWORD reason, LPVOID reserved )
+ {
++    WCHAR value[2];
++
+     if (reason != DLL_PROCESS_ATTACH) return TRUE;
+ 
+     DisableThreadLibraryCalls( inst );
+     gdi32_module = inst;
++    strict_delete_object = GetEnvironmentVariableW( L"WINE_GDI_STRICT_DELETEOBJECT", value,
++                                                    ARRAY_SIZE(value) ) == 1 && value[0] == '1';
+     return TRUE;
+ }
+ 
+@@ -196,6 +201,11 @@ BOOL WINAPI DeleteObject( HGDIOBJ obj )
+     struct hdc_list *hdc_list = NULL;
+     struct wine_rb_entry *entry;
+ 
++    /* Opt-in protection for plugins which delete uninitialized handles. Legacy
++     * short-handle expansion can otherwise turn stack coordinates into another
++     * component's live bitmap or DC. Keep the default compatibility behavior. */
++    if (strict_delete_object && obj && !HIWORD(obj)) return FALSE;
++
+     obj = get_full_gdi_handle( obj );
+     switch (gdi_handle_type( obj ))
+     {
+-- 
+2.55.0
+

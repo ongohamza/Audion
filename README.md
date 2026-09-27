@@ -2,18 +2,24 @@
 
 Audion is a small set of patches for building Wine for music software.
 
-It fixes two problems:
+**Wine 11.18 Staging + PipeASIO:** use the
+[build-and-install script instructions](docs/BUILD_WINE_11.18.md). That script
+installs to `/usr/bin` and uses the 11.18-adapted OpenGL patch. The manual
+instructions below remain for Wine 11.16.
+
+It addresses three problems:
 
 - FL Studio says **“The validity of the program could not be verified.”**
 - Hosted OpenGL/VST plug-in windows flicker or turn blank inside FL Studio.
+- Effectrix can delete FL Studio's graphics objects and crash its renderer (opt-in protection).
 
-These are general Wine compatibility fixes. Audion does **not** crack FL
+The first two are Wine compatibility fixes; the third is a defensive workaround for invalid plugin handles. Audion does **not** crack FL
 Studio, unlock trial features, or skip signature checking. A damaged signature
 is still rejected.
 
 ## Apply the patches — the very easy version
 
-Think of this as putting three Band-Aids on Wine's source code.
+Think of this as putting four Band-Aids on Wine's source code.
 
 You need two folders:
 
@@ -42,7 +48,7 @@ git -C "$HOME/src/wine-audion" checkout 8da89f8493b21ebfbe344a54dbef0cde23c7ea59
 
 That commit is Wine 11.16, the version used for this patch set.
 
-### 3. Apply all three patches
+### 3. Apply all four patches
 
 ```bash
 "$HOME/src/Audion/scripts/apply-patches.sh" "$HOME/src/wine-audion"
@@ -51,13 +57,24 @@ That commit is Wine 11.16, the version used for this patch set.
 Success looks like this:
 
 ```text
-Applying 3 patch(es)
+Applying 4 patch(es)
 crypt32/tests: Test signatures with unsorted authenticated attributes
 crypt32: Preserve authenticated attribute order when verifying
 win32u: Re-present offscreen client surfaces after window flushes
+gdi32: Add opt-in protection against malformed DeleteObject aliases
 ```
 
 That is all “apply the patches” means. Your Wine source now contains the fixes.
+
+If you already have Audion on your Desktop, use that local copy instead:
+
+```bash
+bash "$HOME/Desktop/Audion/scripts/apply-patches.sh" /path/to/clean/wine-source
+```
+
+Use a clean checkout of the pinned Wine commit above. Do not apply the full
+stack again to a Wine tree that already contains Audion patches. Applying
+patches changes source code; rebuilding and installing are still required.
 
 ### 4. Rebuild Wine
 
@@ -84,6 +101,29 @@ This does not replace `/usr/bin/wine`. Wine needs its normal build dependencies,
 including the tools required for both selected architectures. If `configure`
 reports a missing dependency, install that dependency and run it again.
 
+### 5. Enable the Effectrix protection for FL Studio
+
+For the Effectrix protection, start FL Studio with this environment variable:
+
+```bash
+WINE_GDI_STRICT_DELETEOBJECT=1 "$HOME/.local/opt/wine-audion/bin/wine" /path/to/FL64.exe
+```
+
+It is off by default. Enable it only for affected applications: it disables
+legacy short-handle deletion compatibility in that process. See the
+[Effectrix evidence and test record](docs/verification/2026-09-25-effectrix-crash.md).
+
+No patch can promise zero regressions. With this protection enabled, an older
+application or another plugin in the same FL process that intentionally uses
+short deletion handles could fail to release graphics objects. Enable the
+variable only on the FL launch command, not globally in your shell settings.
+To disable it, close FL and relaunch with `WINE_GDI_STRICT_DELETEOBJECT=0`.
+No rebuild is needed to switch it on or off. The previous signature and OpenGL
+fixes remain active either way.
+
+PipeASIO is separate from these four Wine patches. The private-install example
+above does not install or migrate an existing PipeASIO driver.
+
 ## What the script protects you from
 
 `scripts/apply-patches.sh` checks everything before it starts:
@@ -107,16 +147,17 @@ prepared to run the tests again.
 | `crypt32` regression | Proves Wine accepts the valid unusual signature and still rejects a changed signature. |
 | `crypt32` implementation | Hashes authenticated attributes in the original encoded order during verification. |
 | `win32u` implementation | Re-presents an overlapping offscreen plug-in surface after the parent window repaints. |
+| `gdi32` opt-in protection | Rejects malformed short deletion handles before they can resolve to another live graphics object. |
 
 There are no checks for application or plug-in vendors, filenames, product
 versions, publishers, or installation paths in the implementation patches.
 
 ## Verify the patch application
 
-The newest three Wine commits should be the Audion patches:
+The newest four Wine commits should be the Audion patches:
 
 ```bash
-git -C "$HOME/src/wine-audion" log -3 --oneline
+git -C "$HOME/src/wine-audion" log -4 --oneline
 ```
 
 Developers with a local Wine Git repository can run the clean-application test:
@@ -155,6 +196,9 @@ patches/flstudio-authattrs/
 
 patches/opengl-flicker/
   0001-win32u-Re-present-offscreen-client-surfaces-after-wi.patch
+
+patches/effectrix-crash/
+  0001-gdi32-Add-opt-in-protection-against-malformed-Delete.patch
 ```
 
 The repository contains no FL Studio or third-party plug-in binaries.
