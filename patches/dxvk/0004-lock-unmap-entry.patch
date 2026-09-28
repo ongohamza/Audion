@@ -1,0 +1,20 @@
+diff --git a/src/d3d11/d3d11_context_imm.cpp b/src/d3d11/d3d11_context_imm.cpp
+index 2120f71..740143f 100644
+--- a/src/d3d11/d3d11_context_imm.cpp
++++ b/src/d3d11/d3d11_context_imm.cpp
+@@ -311,6 +311,7 @@ namespace dxvk {
+   void STDMETHODCALLTYPE D3D11ImmediateContext::Unmap(
+           ID3D11Resource*             pResource,
+           UINT                        Subresource) {
++    D3D10DeviceLock lock = LockContext();
+     // Since it is very uncommon for images to be mapped compared
+     // to buffers, we count the currently mapped images in order
+     // to avoid a virtual method call in the common case.
+@@ -319,7 +320,6 @@ namespace dxvk {
+       pResource->GetType(&resourceDim);
+ 
+       if (resourceDim != D3D11_RESOURCE_DIMENSION_BUFFER) {
+-        D3D10DeviceLock lock = LockContext();
+         UnmapImage(GetCommonTexture(pResource), Subresource);
+       }
+     }

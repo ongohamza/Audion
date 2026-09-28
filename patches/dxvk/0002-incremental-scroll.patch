@@ -1,0 +1,22 @@
+diff --git a/src/d3d11/d3d11_swapchain.cpp b/src/d3d11/d3d11_swapchain.cpp
+index 49bf2f6..0a89eba 100644
+--- a/src/d3d11/d3d11_swapchain.cpp
++++ b/src/d3d11/d3d11_swapchain.cpp
+@@ -991,13 +1060,14 @@ namespace dxvk {
+     if (scroll) {
+       pContext->EmitCs([
+         cScrollView   = m_compositionScroll->createView(shaderViewInfo),
+-        cBufferView   = backBuffer->createView(shaderViewInfo),
+         cScrollRect   = *pPresentParameters->pScrollRect,
+-        cScrollOffset = *pPresentParameters->pScrollOffset,
+         cResolution   = resolution
+       ] (DxvkContext* ctx) mutable {
++        // pScrollRect is the destination rectangle. The first pass already
++        // saved the complete source rectangle at (0, 0), accounting for the
++        // scroll offset. Do not substitute unpresented back-buffer pixels or
++        // apply the offset a second time. Dirty rectangles are applied below.
+         CompositionArgs args = {};
+-        args.srcOffset = { cScrollRect.left - cScrollOffset.x, cScrollRect.top - cScrollOffset.y };
+         args.dstOffset = { cScrollRect.left, cScrollRect.top };
+         args.extent.width = cScrollRect.right - cScrollRect.left;
+         args.extent.height = cScrollRect.bottom - cScrollRect.top;

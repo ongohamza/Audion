@@ -4,26 +4,29 @@ set -Eeuo pipefail
 
 usage() {
     cat <<'EOF'
-Build Wine 11.18 Staging + four Audion patches + PipeASIO 1.7.0.
-Install prefix: /usr (Wine: /usr/bin/wine; libraries: /usr/lib/wine).
-Usage: bash build-wine-11.18-staging.sh [--prepare-only | --build-only] [--register /absolute/wine-prefix]
+Build Wine 11.18 Staging + Audion patches + PipeASIO 1.7.0.
+Install prefix: /usr/local (Wine: /usr/local/bin/wine; libraries: /usr/local/lib/wine).
+Usage: bash build-wine-11.18-staging.sh [--prepare-only | --build-only] [--update-existing] [--register /absolute/wine-prefix]
   default         Build Wine, install it, then build and install 64-bit PipeASIO.
   --prepare-only  Download, apply patches and configure; no compilation/install.
   --build-only    Also compile Wine; no install or PipeASIO build (needs installed SDK).
   --register DIR  After installation, register PipeASIO in this existing Wine prefix.
+  --update-existing  Validate the original Audion stack, add follow-ups, reuse this build tree.
   --help          Show this help.
 AUDION_BUILD_DIR overrides ~/.cache/audion-wine-11.18-staging.
 Builds use make -j"$(nproc)". No test installation is created.
 Close Wine applications before installation. Do not run this script with sudo.
-The existing /usr/local Wine is not removed; launch the new /usr/bin/wine explicitly.
+This updates /usr/local Wine. It does not delete prefixes or remove /usr Wine.
 EOF
 }
 
 mode=install
 register_prefix=
+update_existing=0
 while (($#)); do
     case $1 in
         --help|-h) usage; exit 0 ;;
+        --update-existing) update_existing=1; shift ;;
         --prepare-only|--build-only)
             [[ $mode == install ]] || { echo 'Choose only one build mode.' >&2; exit 2; }
             mode=${1#--}; shift ;;
@@ -60,10 +63,10 @@ pkg-config --exists freetype2 x11 xext xrender xrandr xi xcursor xfixes gl alsa 
 check_package_conflicts() {
     local file owner
     command -v pacman >/dev/null || return 0
-    for file in /usr/bin/wine /usr/bin/wineserver /usr/bin/winegcc /usr/bin/winebuild \
-                /usr/include/wine/windows/windows.h /usr/lib/wine/x86_64-unix/ntdll.so \
-                /usr/lib/wine/x86_64-windows/ntdll.dll /usr/bin/pipeasio-register \
-                /usr/lib/wine/x86_64-windows/pipeasio64.dll; do
+    for file in /usr/local/bin/wine /usr/local/bin/wineserver /usr/local/bin/winegcc /usr/local/bin/winebuild \
+                /usr/local/include/wine/windows/windows.h /usr/local/lib/wine/x86_64-unix/ntdll.so \
+                /usr/local/lib/wine/x86_64-windows/ntdll.dll /usr/local/bin/pipeasio-register \
+                /usr/local/lib/wine/x86_64-windows/pipeasio64.dll; do
         if owner=$(pacman -Qoq "$file" 2>/dev/null); then
             die "$file is owned by Arch package $owner. Resolve the package conflict before installing custom Wine."
         fi
@@ -91,8 +94,14 @@ patches=(
     "$project_dir/patches/wine-11.18/0001-win32u-Re-present-offscreen-client-surfaces-after-wi.patch"
     "$project_dir/patches/effectrix-crash/0001-gdi32-Add-opt-in-protection-against-malformed-Delete.patch"
 )
-for patch_file in "${patches[@]}"; do [[ -f $patch_file ]] || die "Missing patch: $patch_file"; done
-patch_digest=$(sha256sum "${patches[@]}" | sha256sum | cut -d' ' -f1)
+followup_patches=()
+while IFS= read -r entry || [[ -n $entry ]]; do
+    [[ -z $entry || $entry == \#* ]] && continue
+    [[ $entry == patches/* && $entry != *..* ]] || die "Invalid follow-up patch path: $entry"
+    followup_patches+=("$project_dir/$entry")
+done < "$project_dir/manifests/wine-11.18-followups.list"
+for patch_file in "${patches[@]}" "${followup_patches[@]}"; do [[ -f $patch_file ]] || die "Missing patch: $patch_file"; done
+patch_digest=$(sha256sum "${patches[@]}" "${followup_patches[@]}" | sha256sum | cut -d' ' -f1)
 
 clone_pinned() {
     local url=$1 tag=$2 commit=$3 directory=$4
@@ -112,29 +121,41 @@ clone_pinned https://github.com/M0n7y5/pipeasio.git v1.7.0 "$pipeasio_commit" "$
 source_signature() {
     { git -C "$wine_src" rev-parse HEAD; git -C "$wine_src" diff --binary HEAD; } | sha256sum | cut -d' ' -f1
 }
-if [[ -f $work_dir/prepared ]]; then
+if ((update_existing)); then
+    [[ -f $work_dir/prepared && -f $wine_build/Makefile ]] || die '--update-existing needs an existing prepared Audion build.'
+    git -C "$wine_src" merge-base --is-ancestor "$wine_commit" HEAD || die 'Existing source is not based on pinned Wine 11.18.'
+    bash "$project_dir/scripts/apply-wine-11.18-followups.sh" "$wine_src"
+    (cd "$wine_src" && autoreconf -f && ./tools/make_requests)
+    printf '%s %s\n' "$patch_digest" "$(source_signature)" > "$work_dir/prepared"
+elif [[ -f $work_dir/prepared ]]; then
     read -r saved_patches saved_source < "$work_dir/prepared"
     [[ $saved_patches == "$patch_digest" && $saved_source == "$(source_signature)" ]] ||
-        die 'Prepared source/patches changed. Use a new AUDION_BUILD_DIR; existing files were preserved.'
+        die 'Prepared source/patches changed. For an existing Audion 11.18 build, review changes and use --update-existing; files were preserved.'
 else
     clone_pinned https://github.com/wine-mirror/wine.git wine-11.18 "$wine_commit" "$wine_src"
     export GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-Audion builder}"
     export GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-audion-builder@example.invalid}"
     python3 "$staging_src/staging/patchinstall.py" --all --backend=git-am --no-autoconf --destdir="$wine_src"
     git -C "$wine_src" am "${patches[@]}"
+    for patch_file in "${followup_patches[@]}"; do
+        git -C "$wine_src" apply --check "$patch_file"
+        git -C "$wine_src" apply --index "$patch_file"
+        git -C "$wine_src" -c user.name='Audion builder' -c user.email='audion-builder@example.invalid' \
+            commit -m "Audion: apply $(basename "$patch_file")"
+    done
     (cd "$wine_src" && autoreconf -f && ./tools/make_requests)
     printf '%s %s\n' "$patch_digest" "$(source_signature)" > "$work_dir/prepared"
 fi
 
 mkdir -p "$wine_build"
 # Reassert the destination even on resumed builds. An old Makefile configured
-# for /usr/local must never redirect this script's privileged installation.
-(cd "$wine_build" && "$wine_src/configure" --prefix=/usr --libdir=/usr/lib \
+# for /usr must never redirect this script's privileged installation.
+(cd "$wine_build" && "$wine_src/configure" --prefix=/usr/local --libdir=/usr/local/lib \
     --enable-archs=x86_64,i386 --enable-build-id --disable-tests --with-x --with-opengl \
     --with-freetype --with-alsa --with-pulse --with-gnutls \
     CC=gcc CXX=g++ CFLAGS='-O2 -g' CXXFLAGS='-O2 -g')
 if [[ $mode == prepare-only ]]; then
-    echo 'PASS: Wine 11.18 Staging + all four Audion patches prepared and configured. Nothing installed.'
+    echo 'PASS: Wine 11.18 Staging + Audion patches prepared and configured. Nothing installed.'
     exit 0
 fi
 make -C "$wine_build" -j"$(nproc)"
@@ -144,39 +165,37 @@ if [[ $mode == build-only ]]; then
 fi
 
 check_package_conflicts
-command -v sudo >/dev/null || die 'sudo is required for /usr installation.'
+command -v sudo >/dev/null || die 'sudo is required for /usr/local installation.'
 if pgrep -u "$UID" -x wineserver >/dev/null; then
     die 'A wineserver is running. Save and close Wine applications, stop the old wineserver, then rerun this script (compiled files are reused).'
 fi
 sudo -v
 sudo make -C "$wine_build" install
-[[ $(/usr/bin/wine --version) == wine-11.18*Staging* ]] || die 'Installed Wine is not 11.18 Staging.'
+[[ $(/usr/local/bin/wine --version) == wine-11.18*Staging* ]] || die 'Installed Wine is not 11.18 Staging.'
 
-# Do not discover /usr/local's old Wine compiler, headers or import libraries.
-# All SDK paths and the driver destination belong to this exact /usr build.
-export PATH="/usr/bin:/bin:$PATH"
+# All SDK paths and the driver destination belong to this exact /usr/local build.
+export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
 unset WINEDLLPATH WINELOADER WINESERVER WINEARCH
 pipeasio_build="$work_dir/pipeasio-build"
 cmake -S "$pipeasio_src" -B "$pipeasio_build" -G 'Unix Makefiles' \
-    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib \
-    -DWINEBUILD=/usr/bin/winebuild -DWINEGCC=/usr/bin/winegcc \
-    '-DWINE_INCLUDE_DIRS=/usr/include;/usr/include/wine;/usr/include/wine/windows' \
-    -DWINE_LIB_ROOT=/usr/lib/wine -DPIPEASIO_WINE_INSTALL_ROOT=/usr/lib/wine \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local -DCMAKE_INSTALL_LIBDIR=lib \
+    -DWINEBUILD=/usr/local/bin/winebuild -DWINEGCC=/usr/local/bin/winegcc \
+    '-DWINE_INCLUDE_DIRS=/usr/local/include;/usr/local/include/wine;/usr/local/include/wine/windows' \
+    -DWINE_LIB_ROOT=/usr/local/lib/wine -DPIPEASIO_WINE_INSTALL_ROOT=/usr/local/lib/wine \
     -DPIPEASIO_PE_COMPILER=gcc -DBUILD_ARM64=OFF -DBUILD_WOW64_32=OFF \
     -DBUILD_SETTINGS_PANEL=OFF -DBUILD_TESTS=ON
 make -C "$pipeasio_build" -j"$(nproc)"
 ctest --test-dir "$pipeasio_build" --output-on-failure -LE 'integration|wine|pipewire' -j"$(nproc)"
 sudo cmake --install "$pipeasio_build"
-test -f /usr/lib/wine/x86_64-windows/pipeasio64.dll
-test -f /usr/lib/wine/x86_64-unix/pipeasio64.so
+test -f /usr/local/lib/wine/x86_64-windows/pipeasio64.dll
+test -f /usr/local/lib/wine/x86_64-unix/pipeasio64.so
 if [[ -n $register_prefix ]]; then
-    WINEPREFIX="$register_prefix" WINE=/usr/bin/wine PIPEASIO_PREFIX=/usr \
-        PIPEASIO_REGISTER_CANDIDATES=/usr/lib/wine /usr/bin/pipeasio-register
+    WINEPREFIX="$register_prefix" WINE=/usr/local/bin/wine PIPEASIO_PREFIX=/usr/local \
+        PIPEASIO_REGISTER_CANDIDATES=/usr/local/lib/wine /usr/local/bin/pipeasio-register
 fi
-echo 'Installed: /usr/bin/wine (11.18 Staging), all four Audion patches, and 64-bit PipeASIO 1.7.0.'
-echo 'The older /usr/local Wine is unchanged. Use /usr/bin/wine explicitly.'
-echo 'Enable the Effectrix protection only for FL: WINE_GDI_STRICT_DELETEOBJECT=1 /usr/bin/wine /path/to/FL64.exe'
+echo 'Installed: /usr/local/bin/wine (11.18 Staging), Audion patches, and 64-bit PipeASIO 1.7.0.'
+echo 'Effectrix protection is always active. Use /usr/local/bin/wine explicitly.'
 if [[ -z $register_prefix ]]; then
     echo 'To register PipeASIO in your existing FL prefix (after closing Wine apps):'
-    echo 'WINEPREFIX="$HOME/.wine" WINE=/usr/bin/wine PIPEASIO_PREFIX=/usr PIPEASIO_REGISTER_CANDIDATES=/usr/lib/wine /usr/bin/pipeasio-register'
+    echo 'WINEPREFIX="$HOME/.wine" WINE=/usr/local/bin/wine PIPEASIO_PREFIX=/usr/local PIPEASIO_REGISTER_CANDIDATES=/usr/local/lib/wine /usr/local/bin/pipeasio-register'
 fi

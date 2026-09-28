@@ -1,0 +1,113 @@
+diff --git a/dlls/dcomp/device.c b/dlls/dcomp/device.c
+index 6e047ff..f1289e7 100644
+--- a/dlls/dcomp/device.c
++++ b/dlls/dcomp/device.c
+@@ -40,6 +40,19 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(dcomp);
+ 
++/* Experimental DXVK composition snapshot ABI. Keep this IID/vtable in sync with
++ * IDXGIVkCompositionSnapshot in the separately shipped DXVK patch. */
++DEFINE_GUID(IID_IDXGIVkCompositionSnapshot, 0x4ce354e9,0xda73,0x48bb,0x94,0xd0,0x9a,0xab,0x72,0x73,0x02,0x3d);
++typedef struct dxvk_composition_snapshot dxvk_composition_snapshot;
++struct dxvk_composition_snapshot_vtbl
++{
++    HRESULT (STDMETHODCALLTYPE *QueryInterface)(dxvk_composition_snapshot *, REFIID, void **);
++    ULONG (STDMETHODCALLTYPE *AddRef)(dxvk_composition_snapshot *);
++    ULONG (STDMETHODCALLTYPE *Release)(dxvk_composition_snapshot *);
++    HRESULT (STDMETHODCALLTYPE *GetCompositionSnapshot)(dxvk_composition_snapshot *, IDXGISurface **, UINT64 *);
++};
++struct dxvk_composition_snapshot { const struct dxvk_composition_snapshot_vtbl *lpVtbl; };
++
+ static CRITICAL_SECTION dcomp_cs;
+ static CRITICAL_SECTION_DEBUG dcomp_debug =
+ {
+@@ -407,7 +420,7 @@ done:
+ 
+ static void do_composite_dxgi_surface(const struct composition_target *target,
+                                       const struct composition_visual *visual,
+-                                      IDXGISurface *dxgi_surface)
++                                      IDXGISurface *dxgi_surface, BOOL context_lock_forced)
+ {
+     ID3DDeviceContextState *state = NULL, *old_state = NULL;
+     ID3D11DeviceContext1 *d3d11_device_context1 = NULL;
+@@ -471,7 +484,8 @@ static void do_composite_dxgi_surface(const struct composition_target *target,
+         goto done;
+     }
+ 
+-    ID3D11Multithread_SetMultithreadProtected(multithread, TRUE);
++    if (!context_lock_forced)
++        ID3D11Multithread_SetMultithreadProtected(multithread, TRUE);
+     ID3D11Multithread_Enter(multithread);
+ 
+     /* Is this really necessary? anyway, just to be safe */
+@@ -611,6 +625,7 @@ static HRESULT do_composite(const struct composition_target *target, struct comp
+ {
+     struct composition_visual *child_visual;
+     IDXGISurface *dxgi_surface;
++    BOOL context_lock_forced = FALSE;
+     HRESULT hr;
+ 
+     if (visual->shared_visual_handle)
+@@ -625,8 +640,9 @@ static HRESULT do_composite(const struct composition_target *target, struct comp
+     {
+         if (IsEqualGUID(&visual->content_iid, &IID_IDXGISwapChain1))
+         {
+-            DXGI_SWAP_CHAIN_DESC swapchain_desc;
++            dxvk_composition_snapshot *snapshot;
+             IDXGISwapChain1 *swapchain;
++            UINT64 serial;
+ 
+             hr = IUnknown_QueryInterface(visual->content, &IID_IDXGISwapChain1, (void **)&swapchain);
+             if (FAILED(hr))
+@@ -635,19 +651,27 @@ static HRESULT do_composite(const struct composition_target *target, struct comp
+                 return hr;
+             }
+ 
+-            hr = IDXGISwapChain1_GetDesc(swapchain, &swapchain_desc);
+-            if (FAILED(hr))
++            /* Acquire before entering the D3D11 context lock: DXVK's lock order
++             * is swapchain buffer lock followed by immediate context lock. */
++            hr = IDXGISwapChain1_QueryInterface(swapchain, &IID_IDXGIVkCompositionSnapshot,
++                    (void **)&snapshot);
++            if (SUCCEEDED(hr))
+             {
+-                ERR("Failed to get the swapchain description, hr %#lx.\n", hr);
+-                IDXGISwapChain1_Release(swapchain);
+-                return hr;
++                dxgi_surface = NULL;
++                hr = snapshot->lpVtbl->GetCompositionSnapshot(snapshot, &dxgi_surface, &serial);
++                snapshot->lpVtbl->Release(snapshot);
++                context_lock_forced = TRUE;
++                TRACE("Composition snapshot hr %#lx, serial %s.\n", hr, wine_dbgstr_longlong(serial));
++            }
++            else if (hr == E_NOINTERFACE)
++            {
++                /* Compatibility with providers without snapshot support. */
++                hr = IDXGISwapChain1_GetBuffer(swapchain, 0, &IID_IDXGISurface,
++                        (void **)&dxgi_surface);
+             }
+-
+-            /* The front buffer is the last back buffer because the composition swapchain must
+-                     * be created with DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL */
+-            hr = IDXGISwapChain1_GetBuffer(swapchain, 0, &IID_IDXGISurface,
+-                                           (void **)&dxgi_surface);
+             IDXGISwapChain1_Release(swapchain);
++            if (hr == S_FALSE)
++                goto children; /* No frame yet, including after ResizeBuffers. */
+             if (FAILED(hr))
+             {
+                 ERR("Failed to get the swapchain front buffer, hr %#lx.\n", hr);
+@@ -687,10 +711,11 @@ static HRESULT do_composite(const struct composition_target *target, struct comp
+             return E_FAIL;
+         }
+ 
+-        do_composite_dxgi_surface(target, visual, dxgi_surface);
++        do_composite_dxgi_surface(target, visual, dxgi_surface, context_lock_forced);
+         IDXGISurface_Release(dxgi_surface);
+     }
+ 
++children:
+     LIST_FOR_EACH_ENTRY(child_visual, &visual->child_visuals, struct composition_visual, entry)
+     {
+         do_composite(target, child_visual);

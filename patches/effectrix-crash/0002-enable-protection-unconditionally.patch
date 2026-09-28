@@ -1,0 +1,41 @@
+diff --git a/dlls/gdi32/objects.c b/dlls/gdi32/objects.c
+index a8a7930..217be1c 100644
+--- a/dlls/gdi32/objects.c
++++ b/dlls/gdi32/objects.c
+@@ -57,7 +57,6 @@ struct obj_map_entry
+ };
+ 
+ static CRITICAL_SECTION obj_map_cs;
+-static BOOL strict_delete_object;
+ static CRITICAL_SECTION_DEBUG obj_map_debug =
+ {
+     0, 0, &obj_map_cs,
+@@ -138,14 +137,10 @@ HGDIOBJ get_full_gdi_handle( HGDIOBJ obj )
+  */
+ BOOL WINAPI DllMain( HINSTANCE inst, DWORD reason, LPVOID reserved )
+ {
+-    WCHAR value[2];
+-
+     if (reason != DLL_PROCESS_ATTACH) return TRUE;
+ 
+     DisableThreadLibraryCalls( inst );
+     gdi32_module = inst;
+-    strict_delete_object = GetEnvironmentVariableW( L"WINE_GDI_STRICT_DELETEOBJECT", value,
+-                                                    ARRAY_SIZE(value) ) == 1 && value[0] == '1';
+     return TRUE;
+ }
+ 
+@@ -201,10 +196,10 @@ BOOL WINAPI DeleteObject( HGDIOBJ obj )
+     struct hdc_list *hdc_list = NULL;
+     struct wine_rb_entry *entry;
+ 
+-    /* Opt-in protection for plugins which delete uninitialized handles. Legacy
++    /* Protection for plugins which delete uninitialized handles. Legacy
+      * short-handle expansion can otherwise turn stack coordinates into another
+-     * component's live bitmap or DC. Keep the default compatibility behavior. */
+-    if (strict_delete_object && obj && !HIWORD(obj)) return FALSE;
++     * component's live bitmap or DC. This Audion build always rejects them. */
++    if (obj && !HIWORD(obj)) return FALSE;
+ 
+     obj = get_full_gdi_handle( obj );
+     switch (gdi_handle_type( obj ))

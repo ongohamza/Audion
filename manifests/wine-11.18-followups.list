@@ -1,0 +1,3 @@
+patches/effectrix-crash/0002-enable-protection-unconditionally.patch
+patches/nexus-rendering/0001-d2d1-gpu-layers-and-sprites.patch
+patches/nexus-rendering/0002-dcomp-completed-frame-snapshot.patch

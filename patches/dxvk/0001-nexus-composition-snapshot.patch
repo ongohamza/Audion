@@ -1,0 +1,276 @@
+diff --git a/src/d3d11/d3d11_swapchain.cpp b/src/d3d11/d3d11_swapchain.cpp
+index 49bf2f6..0a89eba 100644
+--- a/src/d3d11/d3d11_swapchain.cpp
++++ b/src/d3d11/d3d11_swapchain.cpp
+@@ -102,7 +102,8 @@ namespace dxvk {
+      || riid == __uuidof(IDXGIVkSwapChain)
+      || riid == __uuidof(IDXGIVkSwapChain1)
+      || riid == __uuidof(IDXGIVkSwapChain2)
+-     || riid == __uuidof(IDXGIVkSwapChain3)) {
++     || riid == __uuidof(IDXGIVkSwapChain3)
++     || riid == __uuidof(IDXGIVkSwapChainComposition)) {
+       *ppvObject = ref(this);
+       return S_OK;
+     }
+@@ -157,6 +158,71 @@ namespace dxvk {
+   }
+ 
+ 
++  HRESULT STDMETHODCALLTYPE D3D11SwapChain::GetCompositionSnapshot(
++          IDXGISurface** surface, UINT64* serial) {
++    if (!surface || !serial)
++      return E_POINTER;
++    *surface = nullptr;
++    *serial = 0;
++
++    if (m_desc.SwapEffect != DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL
++     || m_backBuffers.size() < 2 || m_desc.SampleDesc.Count != 1
++     || (m_desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM
++      && m_desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM))
++      return DXGI_ERROR_UNSUPPORTED;
++    if (m_device->getDeviceStatus() != VK_SUCCESS)
++      return DXGI_ERROR_DEVICE_RESET;
++
++    // Protection must be forced at device creation, before any rendering can
++    // overlap composition. Enabling it here cannot synchronize calls which
++    // already entered the context without a lock.
++    if (!m_parent->GetOptions()->enableContextLock)
++      return DXGI_ERROR_UNSUPPORTED;
++
++    // The caller holds the DXGI buffer lock. Never acquire that lock while
++    // holding this context lock.
++    auto context = m_parent->GetContext();
++    auto lock = context->LockContext();
++    if (!m_hasPresentedFrame)
++      return S_FALSE;
++
++    try {
++      D3D11_TEXTURE2D_DESC desc = {};
++      desc.Width = m_desc.Width;
++      desc.Height = m_desc.Height;
++      desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
++      desc.Format = m_desc.Format;
++      desc.Usage = D3D11_USAGE_DEFAULT;
++      desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++      Com<ID3D11Texture2D> texture;
++      HRESULT hr = m_parent->CreateTexture2D(&desc, nullptr, &texture);
++      if (FAILED(hr))
++        return hr;
++
++      Rc<DxvkImage> source = m_compositionBuffer ? m_compositionBuffer
++        : GetCommonTexture(m_backBuffers.back().ptr())->GetImage();
++      Rc<DxvkImage> destination = GetCommonTexture(texture.ptr())->GetImage();
++      context->EmitCs([source, destination] (DxvkContext* ctx) {
++        VkImageSubresourceLayers subresource = {};
++        subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++        subresource.layerCount = 1;
++        ctx->copyImage(destination, subresource, VkOffset3D(),
++          source, subresource, VkOffset3D(), source->info().extent);
++      });
++      context->FlushCsChunk();
++      hr = texture->QueryInterface(__uuidof(IDXGISurface), reinterpret_cast<void**>(surface));
++      if (SUCCEEDED(hr))
++        *serial = m_frameId;
++      return hr;
++    } catch (const DxvkError& error) {
++      Logger::err(error.message());
++      return E_FAIL;
++    } catch (const std::bad_alloc&) {
++      return E_OUTOFMEMORY;
++    }
++  }
++
++
+   UINT STDMETHODCALLTYPE D3D11SwapChain::GetFrameLatency() {
+     return m_frameLatency;
+   }
+@@ -529,6 +595,8 @@ namespace dxvk {
+ 
+     immediateContext->FlushCsChunk();
+ 
++    m_hasPresentedFrame = true;
++
+     if (m_latency) {
+       m_latency->notifyCpuPresentEnd(m_frameId);
+ 
+@@ -601,6 +669,7 @@ namespace dxvk {
+ 
+ 
+   void D3D11SwapChain::CreateBackBuffers() {
++    m_hasPresentedFrame = false;
+     // Explicitly destroy current swap image before
+     // creating a new one to free up resources
+     m_backBuffers.clear();
+@@ -1007,26 +1077,6 @@ namespace dxvk {
+         draw.vertexCount = 4u;
+         draw.instanceCount = 1u;
+ 
+-        ctx->bindResourceImageView(VK_SHADER_STAGE_FRAGMENT_BIT, 0, std::move(cBufferView));
+-        ctx->pushData(VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(args), &args);
+-        ctx->draw(1u, &draw);
+-
+-        args.srcOffset = { 0, 0 };
+-        args.dstOffset = { cScrollRect.left, cScrollRect.top };
+-        args.extent.width = cScrollRect.right - cScrollRect.left - std::abs(cScrollOffset.x);
+-        args.extent.height = cScrollRect.bottom - cScrollRect.top - std::abs(cScrollOffset.y);
+-        args.resolution = cResolution;
+-
+-        if (cScrollOffset.x > 0) {
+-          args.srcOffset.x += cScrollOffset.x;
+-          args.dstOffset.x += cScrollOffset.x;
+-        }
+-
+-        if (cScrollOffset.y > 0) {
+-          args.srcOffset.y += cScrollOffset.y;
+-          args.dstOffset.y += cScrollOffset.y;
+-        }
+-
+         ctx->bindResourceImageView(VK_SHADER_STAGE_FRAGMENT_BIT, 0, std::move(cScrollView));
+         ctx->pushData(VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(args), &args);
+         ctx->draw(1u, &draw);
+diff --git a/src/d3d11/d3d11_swapchain.h b/src/d3d11/d3d11_swapchain.h
+index b42d3d9..b86343f 100644
+--- a/src/d3d11/d3d11_swapchain.h
++++ b/src/d3d11/d3d11_swapchain.h
+@@ -14,7 +14,7 @@ namespace dxvk {
+   class D3D11Device;
+   class D3D11DXGIDevice;
+ 
+-  class D3D11SwapChain : public ComObject<IDXGIVkSwapChain3> {
++  class D3D11SwapChain : public ComObject<IDXGIVkSwapChainComposition> {
+     constexpr static uint32_t DefaultFrameLatency = 1;
+   public:
+ 
+@@ -48,6 +48,9 @@ namespace dxvk {
+ 
+     UINT STDMETHODCALLTYPE GetImageIndex();
+ 
++    HRESULT STDMETHODCALLTYPE GetCompositionSnapshot(
++            IDXGISurface** surface, UINT64* serial);
++
+     UINT STDMETHODCALLTYPE GetFrameLatency();
+ 
+     HANDLE STDMETHODCALLTYPE GetFrameLatencyEvent();
+@@ -129,6 +132,7 @@ namespace dxvk {
+ 
+     Rc<DxvkImage>             m_compositionBuffer;
+     Rc<DxvkImage>             m_compositionScroll;
++    bool                     m_hasPresentedFrame = false;
+ 
+     Rc<DxvkShader>            m_compositionVs;
+     Rc<DxvkShader>            m_compositionFs;
+diff --git a/src/dxgi/dxgi_factory.cpp b/src/dxgi/dxgi_factory.cpp
+index d89409e..821b545 100644
+--- a/src/dxgi/dxgi_factory.cpp
++++ b/src/dxgi/dxgi_factory.cpp
+@@ -292,6 +292,11 @@ namespace dxvk {
+     }
+ 
+     Logger::warn("DxgiFactory::CreateSwapChainForComposition: Creating dummy swap chain");
++    if (pDesc)
++      Logger::info(str::format("Composition descriptor: ", pDesc->Width, "x", pDesc->Height,
++        " format=", pDesc->Format, " buffers=", pDesc->BufferCount,
++        " effect=", pDesc->SwapEffect, " samples=", pDesc->SampleDesc.Count,
++        " alpha=", pDesc->AlphaMode, " usage=", pDesc->BufferUsage));
+ 
+     return CreateSwapChainBase(pDevice,
+       nullptr, pDesc, nullptr, pRestrictToOutput, ppSwapChain);
+diff --git a/src/dxgi/dxgi_interfaces.h b/src/dxgi/dxgi_interfaces.h
+index 0eaf992..131372e 100644
+--- a/src/dxgi/dxgi_interfaces.h
++++ b/src/dxgi/dxgi_interfaces.h
+@@ -153,6 +153,21 @@ IDXGIVkSwapChain3 : public IDXGIVkSwapChain2 {
+           DXGI_MODE_ROTATION        Rotation) = 0;
+ };
+ 
++// Experimental Wine composition interop. Returned surfaces are immutable,
++// independently owned copies. S_FALSE means no presented frame in this generation.
++MIDL_INTERFACE("4ce354e9-da73-48bb-94d0-9aab7273023d")
++IDXGIVkCompositionSnapshot : public IUnknown {
++  virtual HRESULT STDMETHODCALLTYPE GetCompositionSnapshot(
++          IDXGISurface** surface, UINT64* serial) = 0;
++};
++
++// Separate opt-in presenter version; existing presenter ABIs are unchanged.
++MIDL_INTERFACE("069b1524-8151-4c3c-96c8-70d614ce3f8f")
++IDXGIVkSwapChainComposition : public IDXGIVkSwapChain3 {
++  virtual HRESULT STDMETHODCALLTYPE GetCompositionSnapshot(
++          IDXGISurface** surface, UINT64* serial) = 0;
++};
++
+ 
+ /**
+  * \brief Private DXGI presenter factory
+@@ -490,5 +505,7 @@ __CRT_UUID_DECL(IDXGIVkSwapChain,          0xe4a9059e,0xb569,0x46ab,0x8d,0xe7,0x
+ __CRT_UUID_DECL(IDXGIVkSwapChain1,         0x785326d4,0xb77b,0x4826,0xae,0x70,0x8d,0x08,0x30,0x8e,0xe6,0xd1);
+ __CRT_UUID_DECL(IDXGIVkSwapChain2,         0xaed91093,0xe02e,0x458c,0xbd,0xef,0xa9,0x7d,0xa1,0xa7,0xe6,0xd2);
+ __CRT_UUID_DECL(IDXGIVkSwapChain3,         0xfa25651a,0xae62,0x4ddd,0x90,0x86,0x29,0xea,0x31,0x44,0x82,0x0a);
++__CRT_UUID_DECL(IDXGIVkCompositionSnapshot, 0x4ce354e9,0xda73,0x48bb,0x94,0xd0,0x9a,0xab,0x72,0x73,0x02,0x3d);
++__CRT_UUID_DECL(IDXGIVkSwapChainComposition, 0x069b1524,0x8151,0x4c3c,0x96,0xc8,0x70,0xd6,0x14,0xce,0x3f,0x8f);
+ __CRT_UUID_DECL(IDXGIVkSwapChainFactory,   0xe7d6c3ca,0x23a0,0x4e08,0x9f,0x2f,0xea,0x52,0x31,0xdf,0x66,0x33);
+ #endif
+diff --git a/src/dxgi/dxgi_swapchain.cpp b/src/dxgi/dxgi_swapchain.cpp
+index 71e69f9..1b82930 100644
+--- a/src/dxgi/dxgi_swapchain.cpp
++++ b/src/dxgi/dxgi_swapchain.cpp
+@@ -81,6 +81,15 @@ namespace dxvk {
+       return E_POINTER;
+ 
+     *ppvObject = nullptr;
++
++    if (riid == __uuidof(IDXGIVkCompositionSnapshot) && !m_window && !m_is_d3d12) {
++      Com<IDXGIVkSwapChainComposition> composition;
++      if (FAILED(m_presenter->QueryInterface(__uuidof(IDXGIVkSwapChainComposition),
++          reinterpret_cast<void**>(&composition))))
++        return E_NOINTERFACE;
++      *ppvObject = ref(&m_compositionSnapshot);
++      return S_OK;
++    }
+     
+     if (riid == __uuidof(IUnknown)
+      || riid == __uuidof(IDXGIObject)
+@@ -123,6 +132,20 @@ namespace dxvk {
+   }
+ 
+ 
++  HRESULT STDMETHODCALLTYPE DxgiSwapChain::CompositionSnapshot::GetCompositionSnapshot(
++          IDXGISurface** surface, UINT64* serial) {
++    if (!surface || !serial)
++      return E_POINTER;
++    *surface = nullptr;
++    *serial = 0;
++    std::lock_guard<dxvk::mutex> lock(m_owner->m_lockBuffer);
++    Com<IDXGIVkSwapChainComposition> composition;
++    HRESULT hr = m_owner->m_presenter->QueryInterface(__uuidof(IDXGIVkSwapChainComposition),
++      reinterpret_cast<void**>(&composition));
++    return FAILED(hr) ? hr : composition->GetCompositionSnapshot(surface, serial);
++  }
++
++
+   UINT STDMETHODCALLTYPE DxgiSwapChain::GetCurrentBackBufferIndex() {
+     return m_presenter->GetImageIndex();
+   }
+diff --git a/src/dxgi/dxgi_swapchain.h b/src/dxgi/dxgi_swapchain.h
+index c8da01d..6feafb9 100644
+--- a/src/dxgi/dxgi_swapchain.h
++++ b/src/dxgi/dxgi_swapchain.h
+@@ -22,6 +22,19 @@ namespace dxvk {
+   class DxgiOutput;
+   
+   class DxgiSwapChain : public DxgiObject<IDXGISwapChain4> {
++    class CompositionSnapshot : public IDXGIVkCompositionSnapshot {
++    public:
++      explicit CompositionSnapshot(DxgiSwapChain* owner) : m_owner(owner) { }
++      ULONG STDMETHODCALLTYPE AddRef() final { return m_owner->AddRef(); }
++      ULONG STDMETHODCALLTYPE Release() final { return m_owner->Release(); }
++      HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) final {
++        return m_owner->QueryInterface(iid, object);
++      }
++      HRESULT STDMETHODCALLTYPE GetCompositionSnapshot(IDXGISurface** surface, UINT64* serial) final;
++    private:
++      DxgiSwapChain* m_owner;
++    };
++    CompositionSnapshot m_compositionSnapshot { this };
+     
+   public:
+     

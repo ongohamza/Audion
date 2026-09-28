@@ -4,14 +4,20 @@ Audion is a small set of patches for building Wine for music software.
 
 **Wine 11.18 Staging + PipeASIO:** use the
 [build-and-install script instructions](docs/BUILD_WINE_11.18.md). That script
-installs to `/usr/bin` and uses the 11.18-adapted OpenGL patch. The manual
+installs to `/usr/local/bin` and uses the 11.18-adapted OpenGL patch plus
+always-on Effectrix protection. The manual
 instructions below remain for Wine 11.16.
+
+**Nexus hardware-accelerated GUI:** the paired Wine and DXVK patches address
+missing controls, in-progress-frame flicker and a context-state race.
+Use the [combined Nexus build instructions](docs/NEXUS_RENDERING.md).
 
 It addresses three problems:
 
 - FL Studio says **“The validity of the program could not be verified.”**
 - Hosted OpenGL/VST plug-in windows flicker or turn blank inside FL Studio.
-- Effectrix can delete FL Studio's graphics objects and crash its renderer (opt-in protection).
+- Effectrix can delete FL Studio's graphics objects and crash its renderer
+  (always-on protection in the 11.18 build; legacy 11.16 instructions below are opt-in).
 
 The first two are Wine compatibility fixes; the third is a defensive workaround for invalid plugin handles. Audion does **not** crack FL
 Studio, unlock trial features, or skip signature checking. A damaged signature

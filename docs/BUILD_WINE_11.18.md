@@ -1,9 +1,9 @@
 # Build Wine 11.18 Staging + Audion + PipeASIO
 
 This script is for x86_64 Linux, with Arch dependency checks. It installs Wine
-at **/usr/bin/wine**, its SDK and libraries under **/usr**, and PipeASIO in
-**/usr/lib/wine**. It does not create a separate test installation or remove
-your existing /usr/local Wine.
+at **/usr/local/bin/wine**, its SDK and libraries under **/usr/local**, and PipeASIO in
+**/usr/local/lib/wine**. It updates that installation, without creating a separate
+test installation, deleting a Wine prefix, or removing files under /usr.
 
 ## Run it
 
@@ -13,11 +13,23 @@ Save your work and close all Wine applications. Run as your normal user:
 bash "$HOME/Desktop/Audion/scripts/build-wine-11.18-staging.sh" --register "$HOME/.wine"
 ```
 
+If this build folder already contains the earlier Audion 11.18 build, update
+it in place (reuse downloads and compiled objects):
+
+```bash
+bash "$HOME/Desktop/Audion/scripts/build-wine-11.18-staging.sh" --update-existing --register "$HOME/.wine"
+```
+
+This checks the original four patches and all follow-ups in a private Git
+index before applying missing follow-ups. Conflicts stop without resetting
+your source. Existing unrelated source changes are preserved, so review them
+before building. Do not edit the source or run another build concurrently.
+
 `--register` targets an existing Wine prefix and changes its PipeASIO
 registration. Omit it to build/install without touching a prefix. Running a
 new Wine in an old prefix can update that prefix; back up important prefixes
 first. The script never runs Wine as root. It requests sudo only for installing
-into /usr.
+into /usr/local.
 
 If the install stage reports a running wineserver, save and close Wine apps.
 For the existing /usr/local build, `/usr/local/bin/wineserver -k` stops all Wine
@@ -33,8 +45,9 @@ Source and ordinary compilation files are kept in:
 The script reuses completed downloads and compilation. `build.log` records the
 output. Interrupted patch application is not silently reset: if preparation
 failed, inspect the log and use a new dedicated `AUDION_BUILD_DIR` to start
-fresh. Changed patch contents or prepared tracked source also require a new
-directory. There is no automatic recursive deletion.
+fresh. For the already prepared Audion 11.18 stack, use `--update-existing`
+to validate and apply additions without making another build directory.
+There is no automatic recursive deletion.
 
 ## Dependencies
 
@@ -60,13 +73,14 @@ pacman-managed package. Keep the source/build folder for future maintenance.
 
 1. Wine 11.18: `7b3fff76fa5178f6ce0141b2c776afa2a822f101`.
 2. Wine Staging v11.18: `627ccf4f350f41c6cea57fda05f52e57ba9fab1f`, all Staging patches.
-3. Four Audion patches: two signature patches, the 11.18-context OpenGL patch,
-   and the opt-in Effectrix deletion protection.
+3. Audion patches: two signature patches, the 11.18-context OpenGL patch,
+   Effectrix deletion protection, its always-on follow-up, and the Nexus
+   Direct2D/completed-frame follow-ups listed in the manifest.
 4. Regenerate configure and server protocol files; configure with
-   `--prefix=/usr --libdir=/usr/lib --enable-archs=x86_64,i386`.
+   `--prefix=/usr/local --libdir=/usr/local/lib --enable-archs=x86_64,i386`.
 5. Build Wine using `make -j"$(nproc)"`, then install it.
 6. Build PipeASIO v1.7.0 (`bb7911e0e7590a76c11b9b9843735fb116b9c1bf`), explicitly using
-   `/usr/bin/winebuild`, `/usr/bin/winegcc`, `/usr/include/wine` and `/usr/lib/wine`.
+   `/usr/local/bin/winebuild`, `/usr/local/bin/winegcc`, `/usr/local/include/wine` and `/usr/local/lib/wine`.
    Run its non-integration tests, install, and optionally register.
 
 Wine supports both 64-bit and new-WoW64 32-bit applications. This script builds
@@ -81,26 +95,31 @@ build script for 11.18 Staging; `apply-patches.sh` remains pinned to 11.16.
 
 ## Launch the installed Wine explicitly
 
-The old `/usr/local/bin/wine` may come first in PATH. Avoid that ambiguity:
+Use the explicitly installed binary, irrespective of other Wine packages in PATH:
 
 ```bash
-/usr/bin/wine --version
-WINE_GDI_STRICT_DELETEOBJECT=1 /usr/bin/wine \
+/usr/local/bin/wine --version
+/usr/local/bin/wine \
   "$HOME/.wine/drive_c/Program Files/Image-Line/FL Studio 2026/FL64.exe"
 ```
 
-Effectrix protection is off unless the variable is `1`. Do not export it
-globally. The compatibility trade-off and regression results are documented in
+Effectrix protection is always active in this build, including if the old
+environment variable is set to `0`. The original opt-in implementation's
+compatibility trade-off and regression results are documented in
 [the Effectrix report](verification/2026-09-25-effectrix-crash.md).
 
 If you omitted `--register`, close Wine apps and register later as your normal user:
 
 ```bash
-WINEPREFIX="$HOME/.wine" WINE=/usr/bin/wine PIPEASIO_PREFIX=/usr \
-  PIPEASIO_REGISTER_CANDIDATES=/usr/lib/wine /usr/bin/pipeasio-register
+WINEPREFIX="$HOME/.wine" WINE=/usr/local/bin/wine PIPEASIO_PREFIX=/usr/local \
+  PIPEASIO_REGISTER_CANDIDATES=/usr/local/lib/wine /usr/local/bin/pipeasio-register
 ```
 
 Then select PipeASIO in FL Studio's audio settings.
+
+For accelerated Nexus rendering, also build/install the separate DXVK patch
+set and enable its required options: [Nexus instructions](NEXUS_RENDERING.md).
+Wine's builder does not install DXVK into your prefix.
 
 ## Checks without system installation
 
@@ -117,7 +136,11 @@ build directory, but does not install anything. PipeASIO is compiled by the
 default install run because it needs the newly installed Wine SDK. These checks
 do not by themselves establish runtime stability of FL Studio on 11.18.
 
-### Verification on 2026-09-26
+### Historical verification on 2026-09-26 (superseded /usr destination)
+
+The following records the earlier script, not verification of the current
+/usr/local and always-on changes. Current shell/argument tests pass; a fresh
+end-to-end run of the updated combined script is not yet claimed.
 
 The exact script successfully downloaded and checked the pinned sources,
 applied all Staging patches and all four Audion patches, configured Wine, and

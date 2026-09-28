@@ -1,0 +1,12 @@
+diff --git a/src/d3d11/d3d11_context_imm.cpp b/src/d3d11/d3d11_context_imm.cpp
+index 2120f71..1d19b7c 100644
+--- a/src/d3d11/d3d11_context_imm.cpp
++++ b/src/d3d11/d3d11_context_imm.cpp
+@@ -766,6 +766,7 @@ namespace dxvk {
+   void STDMETHODCALLTYPE D3D11ImmediateContext::SwapDeviceContextState(
+           ID3DDeviceContextState*           pState,
+           ID3DDeviceContextState**          ppPreviousState) {
++    D3D10DeviceLock lock = LockContext();
+     InitReturnPtr(ppPreviousState);
+ 
+     if (!pState)
