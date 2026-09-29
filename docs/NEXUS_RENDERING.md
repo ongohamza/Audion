@@ -106,7 +106,7 @@ bash scripts/build-wine-11.18-staging.sh --update-existing --register "$HOME/.wi
 
 For a fresh Wine build, omit `--update-existing`. Close Wine applications
 before installation. Wine installs to `/usr/local` and compiles using
-`make -j"$(nproc)"`; DXVK uses `ninja -j"$(nproc)"`. Existing downloads/build
+`make -j8`; DXVK uses `ninja -j8` (override both with `AUDION_JOBS`). Existing downloads/build
 objects are reused. PipeASIO and all Wine follow-ups are included by the Wine
 script; DXVK DLLs must be installed into the prefix separately as below.
 Dependencies for DXVK on Arch include `meson`, `ninja`, `glslang`, and
@@ -157,3 +157,32 @@ non-snapshot components and assume the same tested rendering path.
 - All previous Audion patches preserved, including always-on Effectrix protection.
 
 These checks establish the tested configuration, not universal compatibility.
+
+
+## Presentation caching (2026-09-29)
+
+The sixth DXVK patch caches an immutable completed-frame snapshot until the
+next successful presentation or resize. The third Wine Nexus-rendering patch
+reuses its per-visual bitmap, graphics state and read-only GDI DC. Unchanged
+frames can repaint from that DC without another GPU readback. New RGBA frames
+use Direct2D's cached conversion pipeline instead of compiling shaders and
+creating conversion resources every tick. Read-only DC release uses an empty
+dirty rectangle, avoiding an unnecessary upload back to the GPU. Frame pacing
+subtracts composition time from the refresh budget using the performance counter.
+
+These optimizations are active automatically with the existing paired snapshot
+configuration above. No new opt-in setting, fsync requirement, realtime priority,
+timer-resolution change or audio-thread modification is introduced. Normal build
+and install commands above include these patches. Existing five-patch DXVK sources
+upgrade in place; repeated builds preserve the patch stack and user index.
+
+A matched native Wayland synthetic test measured approximately 6% less process CPU
+time during animation and 38% less while idle. Animation wall time was essentially
+unchanged. These are whole-test-process CPU measurements, not measured Nexus input
+latency, compositor frame-rate measurements, or audio/xrun results. See
+[verification](verification/2026-09-29-composition-performance.md).
+
+One synchronous GPU readback remains for each newly composed frame, as does the
+GDI blend into the HWND. This is not zero-copy presentation and does not establish
+that Nexus routing-graph dragging now matches its software renderer. A GPU-only
+compositor needs a separate design for alpha blending, child windows and fallback.

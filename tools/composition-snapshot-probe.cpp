@@ -89,15 +89,48 @@ int main(int argc,char **argv) {
         fill(dev,ctx,sc,0xff00ff00);
         IDXGISurface *retained=acquire(sc,api,&first);
         expect(pixel(dev,ctx,retained)==0xffff0000,"unpresented green does not replace presented red");
-        if(count==2 && !format) {
+        IDXGISurface *again=acquire(sc,api,&serial);
+        IUnknown *a=nullptr,*b=nullptr;
+        CHECK(retained->QueryInterface(__uuidof(IUnknown),(void**)&a));
+        CHECK(again->QueryInterface(__uuidof(IUnknown),(void**)&b));
+        expect(a==b && serial==first,"unchanged present reuses the immutable snapshot allocation");
+        a->Release();b->Release();again->Release();
+        if(count==2) {
             HWND hwnd=CreateWindowExW(0,L"STATIC",L"Composition snapshot regression",WS_OVERLAPPEDWINDOW|WS_VISIBLE,
                 20,20,160,120,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
             IDCompositionDevice *comp=nullptr; IDCompositionTarget *target=nullptr; IDCompositionVisual *visual=nullptr;
+            D3D11_BLEND_DESC blendDesc={};blendDesc.RenderTarget[0].RenderTargetWriteMask=D3D11_COLOR_WRITE_ENABLE_ALL;
+            ID3D11BlendState *blend=nullptr;CHECK(dev->CreateBlendState(&blendDesc,&blend));
+            FLOAT factors[]={0.2f,0.4f,0.6f,0.8f};ctx->OMSetBlendState(blend,factors,0x12345678);
             CHECK(DCompositionCreateDevice(gd,__uuidof(IDCompositionDevice),(void**)&comp));
             CHECK(comp->CreateTargetForHwnd(hwnd,TRUE,&target));CHECK(comp->CreateVisual(&visual));
             CHECK(visual->SetContent(sc));CHECK(target->SetRoot(visual));CHECK(comp->Commit());
             Sleep(250);HDC dc=GetDC(hwnd);COLORREF color=GetPixel(dc,2,2);ReleaseDC(hwnd,dc);
-            expect(color==RGB(255,0,0),"Wine compositor draws presented red instead of unpresented green");
+            expect(color==(format?RGB(0,0,255):RGB(255,0,0)),"Wine compositor preserves BGRA/RGBA channels and presented content");
+            dc=GetDC(hwnd);PatBlt(dc,0,0,16,16,BLACKNESS);ReleaseDC(hwnd,dc);Sleep(100);
+            dc=GetDC(hwnd);color=GetPixel(dc,2,2);ReleaseDC(hwnd,dc);
+            expect(color==(format?RGB(0,0,255):RGB(255,0,0)),"unchanged frame repaints after GDI window damage");
+            CHECK(visual->SetContent(nullptr));CHECK(visual->SetContent(sc));CHECK(comp->Commit());Sleep(100);
+            dc=GetDC(hwnd);color=GetPixel(dc,2,2);ReleaseDC(hwnd,dc);
+            expect(color==(format?RGB(0,0,255):RGB(255,0,0)),"content replacement rebuilds composition cache");
+            ID3D11BlendState *observed=nullptr;FLOAT observedFactors[4];UINT mask;
+            ctx->OMGetBlendState(&observed,observedFactors,&mask);
+            expect(observed==blend && mask==0x12345678 && !memcmp(factors,observedFactors,sizeof(factors)),
+                   "composition restores application immediate-context state");
+            if(observed)observed->Release();ctx->OMSetBlendState(nullptr,nullptr,~0u);blend->Release();
+            // Unbind while clearing the HWND so the previous opaque frame cannot repaint it.
+            CHECK(visual->SetContent(nullptr));
+            dc=GetDC(hwnd);PatBlt(dc,0,0,16,16,BLACKNESS);ReleaseDC(hwnd,dc);
+            fill(dev,ctx,sc,format?0x80000080:0x80800000);
+            D3D11_BOX transparentBox={8,8,0,16,16,1};fill(dev,ctx,sc,0,&transparentBox);
+            CHECK(sc->Present(0,0));CHECK(visual->SetContent(sc));CHECK(comp->Commit());Sleep(300);
+            dc=GetDC(hwnd);color=GetPixel(dc,2,2);COLORREF clear=GetPixel(dc,12,12);ReleaseDC(hwnd,dc);
+            // Existing GDI composition repeats source-over; half-alpha red converges to full red.
+            // Losing alpha yields 128, and double-premultiplication likewise stays too dark.
+            expect(GetRValue(color)>240 && GetGValue(color)<5 && GetBValue(color)<5,
+                   "premultiplied half-alpha red survives BGRA/RGBA conversion");
+            expect(clear==RGB(0,0,0),"fully transparent pixel preserves the background");
+            fill(dev,ctx,sc,0xff00ff00); // Restore the next unpresented frame for the remaining tests.
             CHECK(target->SetRoot(nullptr));CHECK(comp->Commit());visual->Release();target->Release();comp->Release();DestroyWindow(hwnd);
         }
         CHECK(sc->Present(0,0));

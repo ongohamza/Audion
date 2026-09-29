@@ -1,0 +1,708 @@
+diff --git a/dlls/dcomp/dcomp_private.h b/dlls/dcomp/dcomp_private.h
+index ad41d9d..f4358e3 100644
+--- a/dlls/dcomp/dcomp_private.h
++++ b/dlls/dcomp/dcomp_private.h
+@@ -21,7 +21,7 @@
+ #include "dcomp.h"
+ #include "dcomp_private_iface.h"
+ #include "d2d1_1.h"
+-#include <d3d11.h>
++#include <d3d11_1.h>
+ #include "wine/list.h"
+ 
+ struct composition_device
+@@ -78,6 +78,13 @@ struct composition_visual
+     IDCompositionVisualUnknown IDCompositionVisualUnknown_iface;
+     ID2D1GdiInteropRenderTarget *interop;
+     ID2D1DeviceContext *device_context;
++    /* Private compositor resources, never exposed to the application. */
++    ID2D1Bitmap1 *composition_bitmap;
++    ID3DDeviceContextState *composition_state;
++    HDC composition_dc;
++    UINT composition_width, composition_height;
++    UINT64 composition_serial;
++    BOOL composition_valid;
+     IUnknown *content;
+     GUID content_iid;
+     enum DCOMPOSITION_BITMAP_INTERPOLATION_MODE interpolation_mode;
+@@ -136,6 +143,7 @@ static inline struct composition_visual *impl_from_IDCompositionVisualUnknown(ID
+     return CONTAINING_RECORD(iface, struct composition_visual, IDCompositionVisualUnknown_iface);
+ }
+ 
++void composition_visual_clear_cache(struct composition_visual *visual);
+ void dcomp_lock(void);
+ void dcomp_unlock(void);
+ HRESULT create_surface(struct composition_surface_factory *factory, UINT width, UINT height,
+diff --git a/dlls/dcomp/device.c b/dlls/dcomp/device.c
+index f1289e7..c1b3c8c 100644
+--- a/dlls/dcomp/device.c
++++ b/dlls/dcomp/device.c
+@@ -136,470 +136,138 @@ static ULONG STDMETHODCALLTYPE device_Release(IDCompositionDevice *iface)
+     return ref;
+ }
+ 
+-/* TODO: Optimize this. There is plenty of room */
+-static HRESULT create_bgra_surface_from_rgba(IDXGISurface *rgba_surface, IDXGISurface **bgra_surface)
++/* The DC is read-only. An empty dirty rectangle avoids uploading its unchanged
++ * pixels to the GPU when ending a readback lease. */
++void composition_visual_clear_cache(struct composition_visual *visual)
+ {
+-    static const D3D11_INPUT_ELEMENT_DESC layout_desc[] =
++    static const RECT empty_rect;
++    if (visual->composition_dc)
+     {
+-        {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+-        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0},
+-    };
+-
+-    static const char vs_code[] =
+-        "void main(in float4 in_position : POSITION,\n"
+-        "          in float2 in_texcoord : TEXCOORD,\n"
+-        "          out float4 position : SV_Position,\n"
+-        "          out float2 texcoord : TEXCOORD)\n"
+-        "{\n"
+-        "     position = in_position;\n"
+-        "     texcoord = in_texcoord;\n"
+-        "}";
+-
+-    static const char ps_code[] =
+-        "Texture2D src_texture : register(t0);\n"
+-        "SamplerState sam_linear : register(s0);\n"
+-        "float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_TARGET"
+-        "{\n"
+-        "    return src_texture.Sample(sam_linear, uv);\n"
+-        "}";
+-
+-    struct vec2
+-    {
+-        float x, y;
+-    };
+-
+-    static const struct
+-    {
+-        struct vec2 position;
+-        struct vec2 texcoord;
+-    } quad[] =
+-    {
+-        {{-1.0f, 1.0f}, {0.0f, 0.0f}},   /* Top-Left */
+-        {{1.0f, 1.0f}, {1.0f, 0.0f}},    /* Top-Right */
+-        {{-1.0f, -1.0f}, {0.0f, 1.0f}},  /* Bottom-Left */
+-        {{1.0f, -1.0f}, {1.0f, 1.0f}},   /* Bottom-Right */
+-    };
+-
+-    ID3D11Texture2D *src_texture = NULL, *dst_texture = NULL;
+-    ID3DDeviceContextState *state = NULL, *old_state = NULL;
+-    ID3D11DeviceContext1 *d3d11_device_context1 = NULL;
+-    ID3D11DeviceContext *d3d11_device_context = NULL;
+-    static ID3D10Blob *vs_blob = NULL, *ps_blob = NULL;
+-    ID3D11InputLayout *input_layout = NULL;
+-    D3D11_SAMPLER_DESC sampler_desc = {0};
+-    D3D11_SUBRESOURCE_DATA resource_data;
+-    ID3D11ShaderResourceView *srv = NULL;
+-    ID3D11Device1 *d3d11_device = NULL;
+-    ID3D11RenderTargetView *rtv = NULL;
+-    ID3D11SamplerState *sampler = NULL;
+-    D3D11_TEXTURE2D_DESC texture_desc;
+-    DXGI_SURFACE_DESC surface_desc;
+-    D3D11_BUFFER_DESC buffer_desc;
+-    ID3D11VertexShader *vs = NULL;
+-    ID3D11PixelShader *ps = NULL;
+-    unsigned int stride, offset;
+-    ID3D11Buffer *vb = NULL;
+-    D3D11_VIEWPORT vp;
+-    HRESULT hr;
+-
+-    static const D3D_FEATURE_LEVEL feature_levels[] =
+-    {
+-        D3D_FEATURE_LEVEL_11_1,
+-        D3D_FEATURE_LEVEL_11_0,
+-        D3D_FEATURE_LEVEL_10_1,
+-        D3D_FEATURE_LEVEL_10_0,
+-    };
+-
+-    hr = IDXGISurface_QueryInterface(rgba_surface, &IID_ID3D11Texture2D, (void **)&src_texture);
+-    if (FAILED(hr))
+-    {
+-        ERR("Failed to get a ID3D11Texture2D, hr %#lx.\n", hr);
+-        goto done;
+-    }
+-
+-    hr = IDXGISurface_GetDevice(rgba_surface, &IID_ID3D11Device1, (void **)&d3d11_device);
+-    if (FAILED(hr))
+-    {
+-        ERR("Failed to get device, hr %#lx.\n", hr);
+-        goto done;
+-    }
+-
+-    hr = IDXGISurface_GetDesc(rgba_surface, &surface_desc);
+-    if (FAILED(hr))
+-    {
+-        ERR("Failed to get the dxgi surface description, hr %#lx.\n", hr);
+-        goto done;
+-    }
+-
+-    texture_desc.Width = surface_desc.Width;
+-    texture_desc.Height = surface_desc.Height;
+-    texture_desc.MipLevels = 1;
+-    texture_desc.ArraySize = 1;
+-    texture_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+-    texture_desc.SampleDesc.Count = 1;
+-    texture_desc.SampleDesc.Quality = 0;
+-    texture_desc.Usage = D3D11_USAGE_DEFAULT;
+-    texture_desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+-    texture_desc.CPUAccessFlags = 0;
+-    texture_desc.MiscFlags = D3D11_RESOURCE_MISC_GUARDED | D3D11_RESOURCE_MISC_GDI_COMPATIBLE;
+-    hr = ID3D11Device1_CreateTexture2D(d3d11_device, &texture_desc, NULL, &dst_texture);
+-    if (FAILED(hr))
+-    {
+-        ERR("Failed to create a ID3D11Texture2D, hr %#lx.\n", hr);
+-        goto done;
+-    }
+-
+-    hr = ID3D11Device1_CreateShaderResourceView(d3d11_device, (ID3D11Resource *)src_texture, NULL, &srv);
+-    if (FAILED(hr))
+-    {
+-        ERR("Failed to create a SRV, hr %#lx.\n", hr);
+-        goto done;
+-    }
+-
+-    hr = ID3D11Device1_CreateRenderTargetView(d3d11_device, (ID3D11Resource *)dst_texture, NULL, &rtv);
+-    if (FAILED(hr))
+-    {
+-        ERR("Failed to create a RTV, hr %#lx.\n", hr);
+-        goto done;
+-    }
+-
+-    ID3D11Device1_GetImmediateContext(d3d11_device, &d3d11_device_context);
+-    if (FAILED(hr = ID3D11DeviceContext_QueryInterface(d3d11_device_context, &IID_ID3D11DeviceContext1,
+-                                                       (void **)&d3d11_device_context1)))
+-    {
+-        ERR("Failed to query ID3D11DeviceContext1, hr %#lx.\n", hr);
+-        goto done;
+-    }
+-
+-    if (FAILED(hr = ID3D11Device1_CreateDeviceContextState(d3d11_device, 0, feature_levels,
+-                                                           ARRAY_SIZE(feature_levels), D3D11_SDK_VERSION,
+-                                                           &IID_ID3D11Device1, NULL, &state)))
+-    {
+-        ERR("Failed to create device context state, hr %#lx.\n", hr);
+-        goto done;
+-    }
+-    ID3D11DeviceContext1_SwapDeviceContextState(d3d11_device_context1, state, &old_state);
+-
+-    ID3D11DeviceContext1_OMSetRenderTargets(d3d11_device_context1, 1, &rtv, NULL);
+-    ID3D11DeviceContext1_PSSetShaderResources(d3d11_device_context1, 0, 1, &srv);
+-
+-    /* Move this to dcomp device instance ? */
+-    if (vs_blob == NULL)
+-    {
+-        hr = D3DCompile(vs_code, sizeof(vs_code) - 1, "vs", NULL, NULL, "main", "vs_4_0", 0, 0, &vs_blob, NULL);
+-        if (FAILED(hr))
+-        {
+-            ERR("Failed to compile vertex shader, hr %#lx.\n", hr);
+-            goto done;
+-        }
+-
+-        hr = D3DCompile(ps_code, sizeof(ps_code) - 1, "ps", NULL, NULL, "main", "ps_4_0", 0, 0, &ps_blob, NULL);
+-        if (FAILED(hr))
+-        {
+-            ERR("Failed to compile pixel shader, hr %#lx.\n", hr);
+-            goto done;
+-        }
+-    }
+-
+-    hr = ID3D11Device1_CreateVertexShader(d3d11_device, ID3D10Blob_GetBufferPointer(vs_blob),
+-                                          ID3D10Blob_GetBufferSize(vs_blob), NULL, &vs);
+-    if (FAILED(hr))
+-    {
+-        ERR("Failed to create vertex shader, hr %#lx.\n", hr);
+-        goto done;
+-    }
+-
+-    hr = ID3D11Device1_CreatePixelShader(d3d11_device, ID3D10Blob_GetBufferPointer(ps_blob),
+-                                         ID3D10Blob_GetBufferSize(ps_blob), NULL, &ps);
+-    if (FAILED(hr))
+-    {
+-        ERR("Failed to create pixel shader, hr %#lx.\n", hr);
+-        goto done;
+-    }
+-
+-    hr = ID3D11Device1_CreateInputLayout(d3d11_device, layout_desc, ARRAY_SIZE(layout_desc),
+-                                         ID3D10Blob_GetBufferPointer(vs_blob),
+-                                         ID3D10Blob_GetBufferSize(vs_blob), &input_layout);
+-    if (FAILED(hr))
+-    {
+-        ERR("Failed to create input layout, hr %#lx.\n", hr);
+-        goto done;
+-    }
+-
+-    buffer_desc.ByteWidth = sizeof(quad);
+-    buffer_desc.Usage = D3D11_USAGE_DEFAULT;
+-    buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+-    buffer_desc.CPUAccessFlags = 0;
+-    buffer_desc.MiscFlags = 0;
+-    buffer_desc.StructureByteStride = 0;
+-    resource_data.pSysMem = quad;
+-    resource_data.SysMemPitch = 0;
+-    resource_data.SysMemSlicePitch = 0;
+-    hr = ID3D11Device1_CreateBuffer(d3d11_device, &buffer_desc, &resource_data, &vb);
+-    if (FAILED(hr))
+-    {
+-        ERR("Failed to create vertex buffer, hr %#lx.\n", hr);
+-        goto done;
+-    }
+-
+-    sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+-    sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+-    sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+-    sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+-    sampler_desc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+-    sampler_desc.MinLOD = 0;
+-    sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
+-
+-    hr = ID3D11Device1_CreateSamplerState(d3d11_device, &sampler_desc, &sampler);
+-    if (FAILED(hr))
+-    {
+-        ERR("Failed to create sampler state, hr %#lx.\n", hr);
+-        goto done;
++        ID2D1GdiInteropRenderTarget_ReleaseDC(visual->interop, &empty_rect);
++        visual->composition_dc = NULL;
+     }
+-    ID3D11DeviceContext1_PSSetSamplers(d3d11_device_context1, 0, 1, &sampler);
+-
+-    ID3D11DeviceContext1_IASetInputLayout(d3d11_device_context1, input_layout);
+-    ID3D11DeviceContext1_IASetPrimitiveTopology(d3d11_device_context1, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+-
+-    stride = sizeof(quad[0]);
+-    offset = 0;
+-    ID3D11DeviceContext1_IASetVertexBuffers(d3d11_device_context1, 0, 1, &vb, &stride, &offset);
+-    ID3D11DeviceContext1_VSSetShader(d3d11_device_context1, vs, NULL, 0);
+-    ID3D11DeviceContext1_PSSetShader(d3d11_device_context1, ps, NULL, 0);
+-
+-    vp.TopLeftX = 0;
+-    vp.TopLeftY = 0;
+-    vp.Width = surface_desc.Width;
+-    vp.Height = surface_desc.Height;
+-    vp.MinDepth = 0;
+-    vp.MaxDepth = 1;
+-    ID3D11DeviceContext1_RSSetViewports(d3d11_device_context1, 1, &vp);
+-    ID3D11DeviceContext1_Draw(d3d11_device_context1, 4, 0);
+-
+-    hr = ID3D11Texture2D_QueryInterface(dst_texture, &IID_IDXGISurface, (void **)bgra_surface);
+-    if (FAILED(hr))
++    if (visual->composition_bitmap)
+     {
+-        ERR("Failed to get bgra surface, hr %#lx.\n", hr);
+-        goto done;
++        ID2D1DeviceContext_SetTarget(visual->device_context, NULL);
++        ID2D1Bitmap1_Release(visual->composition_bitmap);
++        visual->composition_bitmap = NULL;
+     }
+-
+-done:
+-    if (old_state)
++    if (visual->composition_state)
+     {
+-        ID3D11DeviceContext1_SwapDeviceContextState(d3d11_device_context1, old_state, NULL);
+-        ID3DDeviceContextState_Release(old_state);
++        ID3DDeviceContextState_Release(visual->composition_state);
++        visual->composition_state = NULL;
+     }
+-    if (state)
+-        ID3DDeviceContextState_Release(state);
+-    if (vb)
+-        ID3D11Buffer_Release(vb);
+-    if (sampler)
+-        ID3D11SamplerState_Release(sampler);
+-    if (input_layout)
+-        ID3D11InputLayout_Release(input_layout);
+-    if (ps)
+-        ID3D11PixelShader_Release(ps);
+-    if (vs)
+-        ID3D11VertexShader_Release(vs);
+-    if (d3d11_device_context1)
+-        ID3D11DeviceContext1_Release(d3d11_device_context1);
+-    if (d3d11_device_context)
+-        ID3D11DeviceContext_Release(d3d11_device_context);
+-    if (rtv)
+-        ID3D11RenderTargetView_Release(rtv);
+-    if (srv)
+-        ID3D11ShaderResourceView_Release(srv);
+-    if (dst_texture)
+-        ID3D11Texture2D_Release(dst_texture);
+-    if (d3d11_device)
+-        ID3D11Device1_Release(d3d11_device);
+-    if (src_texture)
+-        ID3D11Texture2D_Release(src_texture);
+-    return hr;
++    visual->composition_valid = FALSE;
+ }
+ 
+-static void do_composite_dxgi_surface(const struct composition_target *target,
+-                                      const struct composition_visual *visual,
+-                                      IDXGISurface *dxgi_surface, BOOL context_lock_forced)
++static HRESULT do_composite_dxgi_surface(const struct composition_target *target,
++        struct composition_visual *visual, IDXGISurface *surface, BOOL versioned, UINT64 serial)
+ {
+-    ID3DDeviceContextState *state = NULL, *old_state = NULL;
+-    ID3D11DeviceContext1 *d3d11_device_context1 = NULL;
+-    ID3D11DeviceContext *d3d11_device_context = NULL;
++    static const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
++                                             D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0};
++    static const BLENDFUNCTION blend = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
++    static const D2D1_COLOR_F transparent;
++    static const RECT empty_rect;
++    ID3D11Device1 *device = NULL;
++    ID3D11DeviceContext *context = NULL;
++    ID3D11DeviceContext1 *context1 = NULL;
+     ID3D11Multithread *multithread = NULL;
+-    D2D1_BITMAP_PROPERTIES1 bitmap_desc;
+-    ID2D1Bitmap1 *target_bitmap = NULL;
+-    ID3D11Device1 *d3d11_device = NULL;
+-    IDXGISurface *bgra_surface = NULL;
+-    DXGI_SURFACE_DESC surface_desc;
+-    ID2D1Bitmap *src_bitmap = NULL;
+-    ID2D1Image *old_target = NULL;
+-    HDC dst_dc, src_dc;
++    ID3DDeviceContextState *old_state = NULL;
++    ID2D1Bitmap *source = NULL;
++    D2D1_BITMAP_PROPERTIES1 props;
++    DXGI_SURFACE_DESC desc;
+     D2D1_SIZE_U size;
+-    DWORD style;
+-    HRESULT hr;
+-
+-    static const BLENDFUNCTION blend_func =
+-    {
+-      AC_SRC_OVER, /* BlendOp */
+-      0,           /* BlendFlag */
+-      255,         /* SourceConstantAlpha */
+-      AC_SRC_ALPHA /* AlphaFormat */
+-    };
+-
+-    static const D3D_FEATURE_LEVEL feature_levels[] =
+-    {
+-        D3D_FEATURE_LEVEL_11_1,
+-        D3D_FEATURE_LEVEL_11_0,
+-        D3D_FEATURE_LEVEL_10_1,
+-        D3D_FEATURE_LEVEL_10_0,
+-    };
+-
+-    if (!target->root)
+-    {
+-        ERR("Target has no root.\n");
+-        goto done;
+-    }
+-
+-    hr = IDXGISurface_GetDevice(dxgi_surface, &IID_ID3D11Device1, (void **)&d3d11_device);
+-    if (FAILED(hr))
+-    {
+-        ERR("Failed to get device, hr %#lx.\n", hr);
+-        goto done;
+-    }
+-
+-    ID3D11Device1_GetImmediateContext(d3d11_device, &d3d11_device_context);
+-    if (FAILED(hr = ID3D11DeviceContext_QueryInterface(d3d11_device_context, &IID_ID3D11DeviceContext1,
+-                                                       (void **)&d3d11_device_context1)))
+-    {
+-        ERR("Failed to query ID3D11DeviceContext1, hr %#lx.\n", hr);
+-        goto done;
+-    }
+-
+-    /* Use ID3D11Multithread to avoid conflicts with rendering in an another thread with the same
+-     * immediate ID3D11DeviceContext */
+-    hr = ID3D11DeviceContext_QueryInterface(d3d11_device_context, &IID_ID3D11Multithread, (void **)&multithread);
+-    if (FAILED(hr))
+-    {
+-        ERR("Failed to query ID3D11Multithread, hr %#lx.\n", hr);
+-        goto done;
+-    }
+-
+-    if (!context_lock_forced)
+-        ID3D11Multithread_SetMultithreadProtected(multithread, TRUE);
++    BOOL entered = FALSE, swapped = FALSE;
++    HRESULT hr = S_OK;
++    HDC dc;
++
++    /* Repaint from the retained CPU image even if the host erased the HWND.
++     * Do not reacquire the GPU context or read back an unchanged present. */
++    if (versioned && visual->composition_valid && visual->composition_serial == serial)
++        goto paint;
++
++    if (FAILED(hr = IDXGISurface_GetDesc(surface, &desc))) goto done;
++    if (desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM && desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM)
++        return DXGI_ERROR_UNSUPPORTED;
++    if (FAILED(hr = IDXGISurface_GetDevice(surface, &IID_ID3D11Device1, (void **)&device))) goto done;
++    ID3D11Device1_GetImmediateContext(device, &context);
++    if (FAILED(hr = ID3D11DeviceContext_QueryInterface(context, &IID_ID3D11DeviceContext1,
++                                                     (void **)&context1))) goto done;
++    if (FAILED(hr = ID3D11DeviceContext_QueryInterface(context, &IID_ID3D11Multithread,
++                                                     (void **)&multithread))) goto done;
++    if (!versioned) ID3D11Multithread_SetMultithreadProtected(multithread, TRUE);
+     ID3D11Multithread_Enter(multithread);
+-
+-    /* Is this really necessary? anyway, just to be safe */
+-    if (FAILED(hr = ID3D11Device1_CreateDeviceContextState(d3d11_device, 0, feature_levels,
+-                                                           ARRAY_SIZE(feature_levels), D3D11_SDK_VERSION,
+-                                                           &IID_ID3D11Device1, NULL, &state)))
++    entered = TRUE;
++    visual->composition_valid = FALSE;
++    if (visual->composition_dc)
+     {
+-        ERR("Failed to create device context state, hr %#lx.\n", hr);
+-        goto done;
++        hr = ID2D1GdiInteropRenderTarget_ReleaseDC(visual->interop, &empty_rect);
++        visual->composition_dc = NULL;
++        if (FAILED(hr)) goto done;
+     }
+-    ID3D11DeviceContext1_SwapDeviceContextState(d3d11_device_context1, state, &old_state);
+-
+-    if (FAILED(hr = IDXGISurface_GetDesc(dxgi_surface, &surface_desc)))
++    if (visual->composition_bitmap && (visual->composition_width != desc.Width
++            || visual->composition_height != desc.Height))
++        composition_visual_clear_cache(visual);
++    if (!visual->composition_state && FAILED(hr = ID3D11Device1_CreateDeviceContextState(device, 0,
++            levels, ARRAY_SIZE(levels), D3D11_SDK_VERSION, &IID_ID3D11Device1, NULL,
++            &visual->composition_state))) goto done;
++    ID3D11DeviceContext1_SwapDeviceContextState(context1, visual->composition_state, &old_state);
++    swapped = TRUE;
++
++    if (!visual->composition_bitmap)
+     {
+-        ERR("Failed to get the dxgi surface description, hr %#lx.\n", hr);
+-        goto done;
++        size.width = desc.Width; size.height = desc.Height;
++        props.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
++        props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
++        props.dpiX = props.dpiY = 96;
++        props.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_GDI_COMPATIBLE;
++        props.colorContext = NULL;
++        if (FAILED(hr = ID2D1DeviceContext_CreateBitmap(visual->device_context, size, NULL, 0,
++                &props, &visual->composition_bitmap))) goto done;
++        visual->composition_width = desc.Width;
++        visual->composition_height = desc.Height;
++        ID2D1DeviceContext_SetTarget(visual->device_context, (ID2D1Image *)visual->composition_bitmap);
++        TRACE("Composition target allocation %ux%u.\n", desc.Width, desc.Height);
+     }
+-
+-    /* Convert DXGI_FORMAT_R8G8B8A8_UNORM to DXGI_FORMAT_B8G8R8A8_UNORM */
+-    if (surface_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM)
+-    {
+-        hr = create_bgra_surface_from_rgba(dxgi_surface, &bgra_surface);
+-        if (FAILED(hr))
+-        {
+-            ERR("Failed to convert DXGI_FORMAT_R8G8B8A8_UNORM surface to DXGI_FORMAT_B8G8R8A8_UNORM, hr %#lx.\n", hr);
+-            goto done;
+-        }
+-        dxgi_surface = bgra_surface;
+-    }
+-    else if (surface_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT)
+-    {
+-        ERR("DXGI_FORMAT_R16G16B16A16_FLOAT surface is currently unsupported.\n");
+-        goto done;
+-    }
+-
+-    size.width = surface_desc.Width;
+-    size.height = surface_desc.Height;
+-    bitmap_desc.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+-    bitmap_desc.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+-    bitmap_desc.dpiX = 0;
+-    bitmap_desc.dpiY = 0;
+-    bitmap_desc.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_GDI_COMPATIBLE;
+-    bitmap_desc.colorContext = NULL;
+-
+-    assert(visual->device_context);
+-    if (FAILED(hr = ID2D1DeviceContext_CreateBitmap(visual->device_context, size, NULL, 0,
+-            &bitmap_desc, &target_bitmap)))
+-    {
+-        ERR("Failed to create a bitmap, hr %#lx.\n", hr);
+-        goto done;
+-    }
+-
+     if (FAILED(hr = ID2D1DeviceContext_CreateSharedBitmap(visual->device_context, &IID_IDXGISurface,
+-            dxgi_surface, NULL, &src_bitmap)))
+-    {
+-        ERR("Failed to create a bitmap from dxgi surface, hr %#lx.\n", hr);
+-        goto done;
+-    }
+-
+-    if (FAILED(hr = ID2D1Bitmap1_CopyFromBitmap(target_bitmap, NULL, src_bitmap, NULL)))
++            surface, NULL, &source))) goto done;
++    if (desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM)
++        hr = ID2D1Bitmap1_CopyFromBitmap(visual->composition_bitmap, NULL, source, NULL);
++    else
+     {
+-        ERR("Failed to copy bitmap, hr %#lx.\n", hr);
+-        goto done;
++        /* Reuse D2D's shader pipeline instead of compiling RGBA conversion
++         * shaders and allocating their textures and views on every frame. */
++        ID2D1DeviceContext_BeginDraw(visual->device_context);
++        ID2D1DeviceContext_Clear(visual->device_context, &transparent);
++        ID2D1DeviceContext_DrawBitmap(visual->device_context, source, NULL, 1.0f,
++                D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, NULL, NULL);
++        hr = ID2D1DeviceContext_EndDraw(visual->device_context, NULL, NULL);
+     }
+-
+-    ID2D1DeviceContext_GetTarget(visual->device_context, &old_target);
+-    ID2D1DeviceContext_SetTarget(visual->device_context, (ID2D1Image *)target_bitmap);
+-    if (FAILED(hr = ID2D1GdiInteropRenderTarget_GetDC(visual->interop, D2D1_DC_INITIALIZE_MODE_COPY,
+-            &src_dc)))
++    if (FAILED(hr)) goto done;
++    hr = ID2D1GdiInteropRenderTarget_GetDC(visual->interop, D2D1_DC_INITIALIZE_MODE_COPY,
++                                        &visual->composition_dc);
++    if (SUCCEEDED(hr))
+     {
+-        ERR("GetDC failed, hr %#lx.\n", hr);
+-        ID2D1DeviceContext_SetTarget(visual->device_context, old_target);
+-        if (old_target)
+-            ID2D1Image_Release(old_target);
+-        goto done;
++        visual->composition_serial = serial;
++        visual->composition_valid = TRUE;
++        TRACE("Composition readback serial %s.\n", wine_dbgstr_longlong(serial));
+     }
+-
+-    style = DCX_USESTYLE | DCX_CACHE;
+-    if (!target->topmost)
+-        style |= DCX_CLIPCHILDREN;
+-    dst_dc = GetDCEx(target->hwnd, 0, style);
+-    GdiAlphaBlend(dst_dc, 0, 0, size.width, size.height, src_dc, 0, 0, size.width, size.height, blend_func);
+-    ReleaseDC(target->hwnd, dst_dc);
+-
+-    ID2D1GdiInteropRenderTarget_ReleaseDC(visual->interop, NULL);
+-    ID2D1DeviceContext_SetTarget(visual->device_context, old_target);
+-    if (old_target)
+-        ID2D1Image_Release(old_target);
+-
+ done:
+-    if (bgra_surface)
+-        IDXGISurface_Release(bgra_surface);
+-    if (src_bitmap)
+-        ID2D1Bitmap_Release(src_bitmap);
+-    if (target_bitmap)
+-        ID2D1Bitmap1_Release(target_bitmap);
+-    if (d3d11_device_context1 && old_state)
+-    {
+-        ID3D11DeviceContext1_SwapDeviceContextState(d3d11_device_context1, old_state, NULL);
+-        ID3DDeviceContextState_Release(old_state);
+-    }
+-    if (state)
+-        ID3DDeviceContextState_Release(state);
+-    if (multithread)
+-    {
+-        ID3D11Multithread_Leave(multithread);
+-        ID3D11Multithread_Release(multithread);
+-    }
+-    if (d3d11_device_context1)
+-        ID3D11DeviceContext1_Release(d3d11_device_context1);
+-    if (d3d11_device_context)
+-        ID3D11DeviceContext_Release(d3d11_device_context);
+-    if (d3d11_device)
+-        ID3D11Device1_Release(d3d11_device);
++    if (source) ID2D1Bitmap_Release(source);
++    if (swapped) ID3D11DeviceContext1_SwapDeviceContextState(context1, old_state, NULL);
++    if (old_state) ID3DDeviceContextState_Release(old_state);
++    if (entered) ID3D11Multithread_Leave(multithread);
++    if (multithread) ID3D11Multithread_Release(multithread);
++    if (context1) ID3D11DeviceContext1_Release(context1);
++    if (context) ID3D11DeviceContext_Release(context);
++    if (device) ID3D11Device1_Release(device);
++    if (FAILED(hr)) return hr;
++paint:
++    dc = GetDCEx(target->hwnd, 0, DCX_USESTYLE | DCX_CACHE | (target->topmost ? 0 : DCX_CLIPCHILDREN));
++    GdiAlphaBlend(dc, 0, 0, visual->composition_width, visual->composition_height,
++            visual->composition_dc, 0, 0, visual->composition_width, visual->composition_height, blend);
++    ReleaseDC(target->hwnd, dc);
++    return S_OK;
+ }
+ 
+ static struct composition_visual * shared_visual_target_get_root(HANDLE shared_visual_handle)
+@@ -626,6 +294,7 @@ static HRESULT do_composite(const struct composition_target *target, struct comp
+     struct composition_visual *child_visual;
+     IDXGISurface *dxgi_surface;
+     BOOL context_lock_forced = FALSE;
++    UINT64 serial = 0;
+     HRESULT hr;
+ 
+     if (visual->shared_visual_handle)
+@@ -642,7 +311,6 @@ static HRESULT do_composite(const struct composition_target *target, struct comp
+         {
+             dxvk_composition_snapshot *snapshot;
+             IDXGISwapChain1 *swapchain;
+-            UINT64 serial;
+ 
+             hr = IUnknown_QueryInterface(visual->content, &IID_IDXGISwapChain1, (void **)&swapchain);
+             if (FAILED(hr))
+@@ -711,8 +379,9 @@ static HRESULT do_composite(const struct composition_target *target, struct comp
+             return E_FAIL;
+         }
+ 
+-        do_composite_dxgi_surface(target, visual, dxgi_surface, context_lock_forced);
++        hr = do_composite_dxgi_surface(target, visual, dxgi_surface, context_lock_forced, serial);
+         IDXGISurface_Release(dxgi_surface);
++        if (FAILED(hr)) WARN("Composition failed, retrying next frame: %#lx.\n", hr);
+     }
+ 
+ children:
+@@ -728,19 +397,24 @@ children:
+ static DWORD WINAPI composite_thread_proc(void *iface)
+ {
+     struct composition_device *device = impl_from_IDCompositionDevice(iface);
+-    unsigned int count, frequency, refresh_period;
++    unsigned int count, frequency;
+     struct composition_target *target;
+     struct composition_visual *visual;
+     HDC hdc;
++    LARGE_INTEGER clock_frequency, started, now;
++    LONGLONG period, remaining;
+ 
+     /* TODO: Implement and use D3DKMTWaitForVerticalBlankEvent() */
+     hdc = GetDC(0);
+     frequency = GetDeviceCaps(hdc, VREFRESH);
+-    refresh_period = 1000 / frequency;
++    if (frequency < 10 || frequency > 1000) frequency = 60;
++    QueryPerformanceFrequency(&clock_frequency);
++    period = clock_frequency.QuadPart / frequency;
+     ReleaseDC(0, hdc);
+ 
+     while (TRUE)
+     {
++        QueryPerformanceCounter(&started);
+         dcomp_lock();
+ 
+         count = 0;
+@@ -775,7 +449,12 @@ static DWORD WINAPI composite_thread_proc(void *iface)
+         if (device->exit_thread)
+             break;
+ 
+-        Sleep(refresh_period);
++        QueryPerformanceCounter(&now);
++        remaining = period - (now.QuadPart - started.QuadPart);
++        /* Include rendering in the budget, round sleeps up, and yield under
++         * overload. Do not raise timer resolution or audio thread priorities. */
++        Sleep(remaining > 0 ? (remaining * 1000 + clock_frequency.QuadPart - 1)
++                / clock_frequency.QuadPart : 1);
+     }
+ 
+     return 0;
+diff --git a/dlls/dcomp/visual.c b/dlls/dcomp/visual.c
+index c4ff363..09d7ad6 100644
+--- a/dlls/dcomp/visual.c
++++ b/dlls/dcomp/visual.c
+@@ -68,6 +68,7 @@ static ULONG STDMETHODCALLTYPE visual_Release(IDCompositionVisualUnknown *iface)
+ 
+     if (!ref)
+     {
++        composition_visual_clear_cache(visual);
+         if (visual->interop)
+             ID2D1GdiInteropRenderTarget_Release(visual->interop);
+         if (visual->device_context)
+@@ -290,6 +291,8 @@ static HRESULT STDMETHODCALLTYPE visual_SetContent(IDCompositionVisualUnknown *i
+         }
+     }
+ 
++    composition_visual_clear_cache(visual);
++
+     if (visual->interop)
+     {
+         ID2D1GdiInteropRenderTarget_Release(visual->interop);

@@ -1,0 +1,59 @@
+diff --git a/src/d3d11/d3d11_swapchain.cpp b/src/d3d11/d3d11_swapchain.cpp
+index 0a89eba..8543a80 100644
+--- a/src/d3d11/d3d11_swapchain.cpp
++++ b/src/d3d11/d3d11_swapchain.cpp
+@@ -186,6 +186,14 @@ namespace dxvk {
+     if (!m_hasPresentedFrame)
+       return S_FALSE;
+ 
++    // One immutable allocation per acquired present, shared by all readers.
++    // The DXGI buffer lock serializes this with Present and ResizeBuffers.
++    if (m_compositionSnapshot) {
++      *surface = m_compositionSnapshot.ref();
++      *serial = m_frameId;
++      return S_OK;
++    }
++
+     try {
+       D3D11_TEXTURE2D_DESC desc = {};
+       desc.Width = m_desc.Width;
+@@ -211,8 +219,10 @@ namespace dxvk {
+       });
+       context->FlushCsChunk();
+       hr = texture->QueryInterface(__uuidof(IDXGISurface), reinterpret_cast<void**>(surface));
+-      if (SUCCEEDED(hr))
++      if (SUCCEEDED(hr)) {
++        m_compositionSnapshot = *surface;
+         *serial = m_frameId;
++      }
+       return hr;
+     } catch (const DxvkError& error) {
+       Logger::err(error.message());
+@@ -595,6 +605,7 @@ namespace dxvk {
+ 
+     immediateContext->FlushCsChunk();
+ 
++    m_compositionSnapshot = nullptr;
+     m_hasPresentedFrame = true;
+ 
+     if (m_latency) {
+@@ -669,6 +680,7 @@ namespace dxvk {
+ 
+ 
+   void D3D11SwapChain::CreateBackBuffers() {
++    m_compositionSnapshot = nullptr;
+     m_hasPresentedFrame = false;
+     // Explicitly destroy current swap image before
+     // creating a new one to free up resources
+diff --git a/src/d3d11/d3d11_swapchain.h b/src/d3d11/d3d11_swapchain.h
+index b86343f..d05c054 100644
+--- a/src/d3d11/d3d11_swapchain.h
++++ b/src/d3d11/d3d11_swapchain.h
+@@ -132,6 +132,7 @@ namespace dxvk {
+ 
+     Rc<DxvkImage>             m_compositionBuffer;
+     Rc<DxvkImage>             m_compositionScroll;
++    Com<IDXGISurface>         m_compositionSnapshot;
+     bool                     m_hasPresentedFrame = false;
+ 
+     Rc<DxvkShader>            m_compositionVs;

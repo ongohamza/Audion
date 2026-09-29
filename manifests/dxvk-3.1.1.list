@@ -1,0 +1,6 @@
+patches/dxvk/0001-nexus-composition-snapshot.patch
+patches/dxvk/0002-incremental-scroll.patch
+patches/dxvk/0003-lock-context-state-swap.patch
+patches/dxvk/0004-lock-unmap-entry.patch
+patches/dxvk/0005-lock-import-allocation-pool.patch
+patches/dxvk/0006-cache-completed-frame-snapshots.patch

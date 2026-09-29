@@ -4,3 +4,4 @@ patches/nexus-rendering/0002-dcomp-completed-frame-snapshot.patch
 patches/wayland/0001-flstudio-wayland-input-and-move.patch
 patches/wayland/0002-enable-flstudio-compatibility-by-default.patch
 patches/wayland/0003-match-window-hit-tests-to-wayland-input.patch
+patches/nexus-rendering/0003-reuse-composition-presentation-resources.patch
