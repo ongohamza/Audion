@@ -1,3 +1,6 @@
 patches/effectrix-crash/0002-enable-protection-unconditionally.patch
 patches/nexus-rendering/0001-d2d1-gpu-layers-and-sprites.patch
 patches/nexus-rendering/0002-dcomp-completed-frame-snapshot.patch
+patches/wayland/0001-flstudio-wayland-input-and-move.patch
+patches/wayland/0002-enable-flstudio-compatibility-by-default.patch
+patches/wayland/0003-match-window-hit-tests-to-wayland-input.patch

@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 usage() {
     cat <<'EOF'
-Build Wine 11.18 Staging + Audion patches + PipeASIO 1.7.0.
+Build Wine 11.18 Staging + Audion + FL Studio Wayland fixes + PipeASIO 1.7.0.
 Install prefix: /usr/local (Wine: /usr/local/bin/wine; libraries: /usr/local/lib/wine).
 Usage: bash build-wine-11.18-staging.sh [--prepare-only | --build-only] [--update-existing] [--register /absolute/wine-prefix]
   default         Build Wine, install it, then build and install 64-bit PipeASIO.
@@ -14,12 +14,14 @@ Usage: bash build-wine-11.18-staging.sh [--prepare-only | --build-only] [--updat
   --update-existing  Validate the original Audion stack, add follow-ups, reuse this build tree.
   --help          Show this help.
 AUDION_BUILD_DIR overrides ~/.cache/audion-wine-11.18-staging.
-Builds use make -j"$(nproc)". No test installation is created.
+AUDION_JOBS controls build jobs (default 8). No test installation is created.
 Close Wine applications before installation. Do not run this script with sudo.
 This updates /usr/local Wine. It does not delete prefixes or remove /usr Wine.
 EOF
 }
 
+jobs=${AUDION_JOBS:-8}
+[[ $jobs =~ ^[1-9][0-9]*$ ]] || { echo "AUDION_JOBS must be a positive integer" >&2; exit 2; }
 mode=install
 register_prefix=
 update_existing=0
@@ -57,7 +59,7 @@ for command in git python3 perl autoreconf make gcc g++ flex bison pkg-config cm
     command -v "$command" >/dev/null || die "Missing $command. On Arch, install build dependencies (see docs/BUILD_WINE_11.18.md)."
 done
 pkg-config --atleast-version=1.4.2 libpipewire-0.3 || die 'PipeASIO needs libpipewire >= 1.4.2 (Arch: libpipewire).'
-pkg-config --exists freetype2 x11 xext xrender xrandr xi xcursor xfixes gl alsa libpulse gnutls ||
+pkg-config --exists wayland-client wayland-egl xkbcommon xkbregistry freetype2 x11 xext xrender xrandr xi xcursor xfixes gl alsa libpulse gnutls ||
     die 'Missing Wine graphics/audio development libraries; see docs/BUILD_WINE_11.18.md.'
 
 check_package_conflicts() {
@@ -151,14 +153,14 @@ mkdir -p "$wine_build"
 # Reassert the destination even on resumed builds. An old Makefile configured
 # for /usr must never redirect this script's privileged installation.
 (cd "$wine_build" && "$wine_src/configure" --prefix=/usr/local --libdir=/usr/local/lib \
-    --enable-archs=x86_64,i386 --enable-build-id --disable-tests --with-x --with-opengl \
+    --enable-archs=x86_64,i386 --enable-build-id --disable-tests --with-x --with-wayland --with-opengl \
     --with-freetype --with-alsa --with-pulse --with-gnutls \
     CC=gcc CXX=g++ CFLAGS='-O2 -g' CXXFLAGS='-O2 -g')
 if [[ $mode == prepare-only ]]; then
     echo 'PASS: Wine 11.18 Staging + Audion patches prepared and configured. Nothing installed.'
     exit 0
 fi
-make -C "$wine_build" -j"$(nproc)"
+make -C "$wine_build" -j"$jobs"
 if [[ $mode == build-only ]]; then
     echo 'PASS: Wine built. Nothing installed; PipeASIO will build against the new SDK during the install run.'
     exit 0
@@ -172,6 +174,11 @@ fi
 sudo -v
 sudo make -C "$wine_build" install
 [[ $(/usr/local/bin/wine --version) == wine-11.18*Staging* ]] || die 'Installed Wine is not 11.18 Staging.'
+# Verify the installed driver contains the automatic FL compatibility build.
+grep -a -q 'WINE_WAYLAND_FLSTUDIO' /usr/local/lib/wine/x86_64-unix/winewayland.so ||
+    die 'Installed Wayland driver is missing the FL compatibility patch.'
+grep -a -q 'fl64.exe' /usr/local/lib/wine/x86_64-unix/winewayland.so ||
+    die 'Installed Wayland driver is missing automatic FL activation.'
 
 # All SDK paths and the driver destination belong to this exact /usr/local build.
 export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
@@ -184,8 +191,8 @@ cmake -S "$pipeasio_src" -B "$pipeasio_build" -G 'Unix Makefiles' \
     -DWINE_LIB_ROOT=/usr/local/lib/wine -DPIPEASIO_WINE_INSTALL_ROOT=/usr/local/lib/wine \
     -DPIPEASIO_PE_COMPILER=gcc -DBUILD_ARM64=OFF -DBUILD_WOW64_32=OFF \
     -DBUILD_SETTINGS_PANEL=OFF -DBUILD_TESTS=ON
-make -C "$pipeasio_build" -j"$(nproc)"
-ctest --test-dir "$pipeasio_build" --output-on-failure -LE 'integration|wine|pipewire' -j"$(nproc)"
+make -C "$pipeasio_build" -j"$jobs"
+ctest --test-dir "$pipeasio_build" --output-on-failure -LE 'integration|wine|pipewire' -j"$jobs"
 sudo cmake --install "$pipeasio_build"
 test -f /usr/local/lib/wine/x86_64-windows/pipeasio64.dll
 test -f /usr/local/lib/wine/x86_64-unix/pipeasio64.so

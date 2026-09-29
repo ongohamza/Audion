@@ -1,0 +1,360 @@
+diff --git a/dlls/winewayland.drv/wayland_pointer.c b/dlls/winewayland.drv/wayland_pointer.c
+index 0c190a9..ff85c2e 100644
+--- a/dlls/winewayland.drv/wayland_pointer.c
++++ b/dlls/winewayland.drv/wayland_pointer.c
+@@ -162,7 +162,7 @@ static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy)
+           hwnd, wl_fixed_to_double(sx), wl_fixed_to_double(sy),
+           screen.x, screen.y);
+ 
+-    NtUserSendHardwareInput(hwnd, SEND_HWMSG_RAWINPUT, &input, 0);
++    NtUserSendHardwareInput(hwnd, wayland_pointer_flags, &input, 0);
+ }
+ 
+ static void pointer_handle_motion(void *data, struct wl_pointer *wl_pointer,
+@@ -223,6 +223,7 @@ static void pointer_handle_leave(void *data, struct wl_pointer *wl_pointer,
+     pthread_mutex_lock(&pointer->mutex);
+     pointer->focused_hwnd = NULL;
+     pointer->enter_serial = 0;
++    pointer->left_button_serial = 0;
+     pthread_mutex_unlock(&pointer->mutex);
+ }
+ 
+@@ -263,11 +264,15 @@ static void pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
+     pthread_mutex_lock(&pointer->mutex);
+     pointer->button_serial = state == WL_POINTER_BUTTON_STATE_PRESSED ?
+                              serial : 0;
++    if (button == BTN_LEFT)
++    {
++        pointer->left_button_serial = state == WL_POINTER_BUTTON_STATE_PRESSED ? serial : 0;
++    }
+     pthread_mutex_unlock(&pointer->mutex);
+ 
+     TRACE("hwnd=%p button=%#x state=%u\n", hwnd, button, state);
+ 
+-    NtUserSendHardwareInput(hwnd, SEND_HWMSG_RAWINPUT, &input, 0);
++    NtUserSendHardwareInput(hwnd, wayland_pointer_flags, &input, 0);
+ }
+ 
+ static void pointer_handle_axis(void *data, struct wl_pointer *wl_pointer,
+@@ -278,7 +283,7 @@ static void pointer_handle_axis(void *data, struct wl_pointer *wl_pointer,
+ static void pointer_handle_frame(void *data, struct wl_pointer *wl_pointer)
+ {
+     static const INPUT input = { .type = INPUT_MOUSE, .mi.dwFlags = MOUSEEVENTF_MOVE_NOCOALESCE };
+-    NtUserSendHardwareInput(NULL, SEND_HWMSG_RAWINPUT, &input, 0); /* flush win32u accumulated motion */
++    NtUserSendHardwareInput(NULL, wayland_pointer_flags, &input, 0); /* flush win32u accumulated motion */
+ }
+ 
+ static void pointer_handle_axis_source(void *data, struct wl_pointer *wl_pointer,
+@@ -316,7 +321,7 @@ static void pointer_handle_axis_value120(void *data, struct wl_pointer *wl_point
+ 
+     TRACE("hwnd=%p axis=%u value120=%d\n", hwnd, axis, value120);
+ 
+-    NtUserSendHardwareInput(hwnd, SEND_HWMSG_RAWINPUT, &input, 0);
++    NtUserSendHardwareInput(hwnd, wayland_pointer_flags, &input, 0);
+ }
+ 
+ static void pointer_handle_axis_discrete(void *data, struct wl_pointer *wl_pointer,
+@@ -398,7 +403,7 @@ static void relative_pointer_v1_relative_motion(void *private,
+           hwnd, wl_fixed_to_double(dx), wl_fixed_to_double(dy), input.mi.dx, input.mi.dy,
+           wl_fixed_to_double(dx_unaccel), wl_fixed_to_double(dy_unaccel), raw_pos.x, raw_pos.y);
+ 
+-    NtUserSendHardwareInput(hwnd, SEND_HWMSG_RAWINPUT, &input, (LPARAM)&raw);
++    NtUserSendHardwareInput(hwnd, wayland_pointer_flags, &input, (LPARAM)&raw);
+ }
+ 
+ static const struct zwp_relative_pointer_v1_listener relative_pointer_v1_listener =
+@@ -686,10 +691,25 @@ clear_cursor:
+     wayland_pointer_clear_cursor_surface();
+ }
+ 
+-static void reapply_cursor_clipping(void)
++void wayland_reapply_cursor_clipping(void)
+ {
+     RECT rect;
+-    UINT context = NtUserSetThreadDpiAwarenessContext(NTUSER_DPI_PER_MONITOR_AWARE);
++    UINT context;
++
++    if (flstudio_compat)
++    {
++        /* Reapply the existing constraint without turning ClipCursor(NULL)
++         * into an explicit application clip to the virtual desktop. */
++        SERVER_START_REQ(set_cursor)
++        {
++            req->flags = SET_CURSOR_REAPPLY;
++            wine_server_call(req);
++        }
++        SERVER_END_REQ;
++        return;
++    }
++
++    context = NtUserSetThreadDpiAwarenessContext(NTUSER_DPI_PER_MONITOR_AWARE);
+     if (NtUserGetClipCursor(&rect)) NtUserClipCursor(&rect);
+     NtUserSetThreadDpiAwarenessContext(context);
+ }
+@@ -821,7 +841,7 @@ static void wayland_set_cursor(HWND hwnd, HCURSOR hcursor, BOOL use_hcursor)
+ 
+     /* Reapply cursor clip since cursor visibility affects pointer constraint
+      * behavior. */
+-    if (reapply_clip) reapply_cursor_clipping();
++    if (reapply_clip) wayland_reapply_cursor_clipping();
+ }
+ 
+ /**********************************************************************
+@@ -1000,7 +1020,7 @@ BOOL WAYLAND_SetCursorPos(INT x, INT y)
+     pthread_mutex_unlock(&pointer->mutex);
+ 
+     TRACE("warping to %d,%d\n", x, y);
+-    reapply_cursor_clipping();
++    wayland_reapply_cursor_clipping();
+     return TRUE;
+ }
+ 
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index c776675..c166e8b 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -59,6 +59,9 @@
+  */
+ 
+ extern char *process_name;
++extern BOOL flstudio_compat;
++extern UINT wayland_pointer_flags;
++void wayland_reapply_cursor_clipping(void);
+ extern struct wayland process_wayland;
+ 
+ /**********************************************************************
+@@ -117,6 +120,8 @@ struct wayland_pointer
+     BOOL pending_warp;
+     uint32_t enter_serial;
+     uint32_t button_serial;
++    uint32_t left_button_serial;
++    uint32_t custom_move_serial;
+     struct wayland_cursor cursor;
+     double accum_x;
+     double accum_y;
+diff --git a/dlls/winewayland.drv/waylanddrv_main.c b/dlls/winewayland.drv/waylanddrv_main.c
+index 275a390..08f912d 100644
+--- a/dlls/winewayland.drv/waylanddrv_main.c
++++ b/dlls/winewayland.drv/waylanddrv_main.c
+@@ -29,8 +29,11 @@
+ #include "ntstatus.h"
+ 
+ #include "waylanddrv.h"
++#include "wine/server_protocol.h"
+ 
+ char *process_name = NULL;
++BOOL flstudio_compat;
++UINT wayland_pointer_flags = SEND_HWMSG_RAWINPUT;
+ 
+ static const struct user_driver_funcs waylanddrv_funcs =
+ {
+@@ -95,6 +98,11 @@ static NTSTATUS waylanddrv_unix_init(void *arg)
+ 
+     wayland_init_process_name();
+ 
++    /* Opt in once, never query environment variables on the input path. */
++    flstudio_compat = getenv("WINE_WAYLAND_FLSTUDIO") &&
++                      !strcmp(getenv("WINE_WAYLAND_FLSTUDIO"), "1");
++    if (flstudio_compat) wayland_pointer_flags |= SEND_HWMSG_NO_VSCREEN_CLIP;
++
+     if (!wayland_process_init()) goto err;
+ 
+     return 0;
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index 270fdfb..588047e 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -164,14 +164,6 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
+     conf->managed = data->managed;
+ }
+ 
+-static void reapply_cursor_clipping(void)
+-{
+-    RECT rect;
+-    UINT context = NtUserSetThreadDpiAwarenessContext(NTUSER_DPI_PER_MONITOR_AWARE);
+-    if (NtUserGetClipCursor(&rect)) NtUserClipCursor(&rect);
+-    NtUserSetThreadDpiAwarenessContext(context);
+-}
+-
+ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data, struct wayland_surface *owner_surface)
+ {
+     struct wayland_surface *surface;
+@@ -230,7 +222,7 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
+ 
+     /* Size/position changes affect the effective pointer constraint, so update
+      * it as needed. */
+-    if (data->hwnd == NtUserGetForegroundWindow()) reapply_cursor_clipping();
++    if (data->hwnd == NtUserGetForegroundWindow()) wayland_reapply_cursor_clipping();
+ 
+     TRACE("hwnd=%p surface=%p=>%p\n", data->hwnd, data->wayland_surface, surface);
+     data->wayland_surface = surface;
+@@ -412,18 +404,70 @@ void WAYLAND_DestroyWindow(HWND hwnd)
+     wayland_win_data_destroy(data);
+ }
+ 
++/* FL's borderless plugin wrapper moves with SetWindowPos instead of SC_MOVE.
++ * Only translate a position-only change during an actual left-button gesture.
++ * The existing SysCommand path handles conventional non-client drags. */
++static BOOL wayland_flstudio_move(struct wayland_win_data *data, UINT flags,
++                                  const struct window_rects *rects)
++{
++    static const WCHAR plugin_class[] = {'T','P','l','u','g','i','n','F','o','r','m',0};
++    struct wayland_pointer *pointer = &process_wayland.pointer;
++    struct wayland_surface *surface = data->wayland_surface;
++    WCHAR buffer[64];
++    UNICODE_STRING name = {0, sizeof(buffer), buffer};
++    uint32_t serial = 0;
++
++    if (!flstudio_compat || (flags & (SWP_NOMOVE | SWP_HIDEWINDOW | SWP_SHOWWINDOW)) ||
++        !surface || !wayland_surface_is_toplevel(surface) ||
++        rects->window.right - rects->window.left != data->rects.window.right - data->rects.window.left ||
++        rects->window.bottom - rects->window.top != data->rects.window.bottom - data->rects.window.top ||
++        (rects->window.left == data->rects.window.left &&
++         rects->window.top == data->rects.window.top)) return FALSE;
++
++    if (NtUserGetClassName(data->hwnd, FALSE, &name) != ARRAY_SIZE(plugin_class) - 1 ||
++        memcmp(buffer, plugin_class, sizeof(plugin_class) - sizeof(WCHAR))) return FALSE;
++
++    pthread_mutex_lock(&pointer->mutex);
++    if (pointer->focused_hwnd == data->hwnd && pointer->left_button_serial &&
++        pointer->custom_move_serial != pointer->left_button_serial)
++        serial = pointer->left_button_serial;
++    if (serial)
++    {
++        pthread_mutex_lock(&process_wayland.seat.mutex);
++        if (process_wayland.seat.wl_seat)
++        {
++            pointer->custom_move_serial = serial;
++            xdg_toplevel_move(surface->xdg_toplevel, process_wayland.seat.wl_seat, serial);
++        }
++        else serial = 0;
++        pthread_mutex_unlock(&process_wayland.seat.mutex);
++    }
++    pthread_mutex_unlock(&pointer->mutex);
++    if (serial) wl_display_flush(process_wayland.wl_display);
++    return !!serial;
++}
++
+ /***********************************************************************
+  *           WAYLAND_WindowPosChanging
+  */
+ BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const struct window_rects *rects)
+ {
+     struct wayland_win_data *data = wayland_win_data_get(hwnd);
++    BOOL moved;
+ 
+     TRACE("hwnd %p, swp_flags %04x, shaped %u, rects %s\n", hwnd, swp_flags, shaped, debugstr_window_rects(rects));
+ 
+     if (!data && !(data = wayland_win_data_create(hwnd, rects))) return FALSE;
+ 
++    moved = wayland_flstudio_move(data, swp_flags, rects);
+     wayland_win_data_release(data);
++    if (moved)
++    {
++        /* End FL's drag as we hand the physical gesture to the compositor.
++         * A compositor move need not return pointer focus to this surface. */
++        INPUT input = { .type = INPUT_MOUSE, .mi.dwFlags = MOUSEEVENTF_LEFTUP };
++        NtUserSendHardwareInput(hwnd, wayland_pointer_flags, &input, 0);
++    }
+ 
+     return TRUE;
+ }
+diff --git a/server/protocol.def b/server/protocol.def
+index 937cd4f..5fe9039 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -2436,6 +2436,7 @@ enum message_type
+ @END
+ #define SEND_HWMSG_INJECTED    0x01  /* message is injected from application */
+ #define SEND_HWMSG_RAWINPUT    0x02  /* don't generate WM_INPUT x / y updates */
++#define SEND_HWMSG_NO_VSCREEN_CLIP 0x04 /* driver coordinates need not fit the virtual screen */
+ 
+ 
+ /* Get a message from the current queue */
+@@ -4082,6 +4083,7 @@ struct handle_info
+ #define SET_CURSOR_CLIP   0x08
+ #define SET_CURSOR_NOCLIP 0x10
+ #define SET_CURSOR_FSCLIP 0x20
++#define SET_CURSOR_REAPPLY 0x40 /* reapply the current clip without changing its origin */
+ 
+ /* Get the history of the 64 last cursor positions */
+ @REQ(get_cursor_history)
+diff --git a/server/queue.c b/server/queue.c
+index 75f950c..7d512cf 100644
+--- a/server/queue.c
++++ b/server/queue.c
+@@ -531,8 +531,13 @@ static int update_desktop_cursor_pos( struct desktop *desktop, user_handle_t win
+     int updated;
+     unsigned int time = get_tick_count();
+ 
+-    x = max( min( x, desktop_shm->cursor.clip.right - 1 ), desktop_shm->cursor.clip.left );
+-    y = max( min( y, desktop_shm->cursor.clip.bottom - 1 ), desktop_shm->cursor.clip.top );
++    /* Wayland exposes surface-local coordinates, not the compositor's desktop
++     * placement. Keep the driver mapping intact, but honor application clips. */
++    if (!(desktop->cursor_flags & SEND_HWMSG_NO_VSCREEN_CLIP) || (desktop->clip_flags & SET_CURSOR_CLIP))
++    {
++        x = max( min( x, desktop_shm->cursor.clip.right - 1 ), desktop_shm->cursor.clip.left );
++        y = max( min( y, desktop_shm->cursor.clip.bottom - 1 ), desktop_shm->cursor.clip.top );
++    }
+ 
+     SHARED_WRITE_BEGIN( desktop_shm, desktop_shm_t )
+     {
+@@ -631,10 +636,13 @@ void set_clip_rectangle( struct desktop *desktop, const struct rectangle *rect,
+     old_flags = desktop->clip_flags;
+     desktop->clip_flags = flags;
+ 
+-    /* warp the mouse to be inside the clip rect */
+-    x = max( min( desktop_shm->cursor.x, new_rect.right - 1 ), new_rect.left );
+-    y = max( min( desktop_shm->cursor.y, new_rect.bottom - 1 ), new_rect.top );
+-    if (x != desktop_shm->cursor.x || y != desktop_shm->cursor.y) set_cursor_pos( desktop, x, y );
++    /* A default clip reset must not undo the driver's surface mapping. */
++    if (!(desktop->cursor_flags & SEND_HWMSG_NO_VSCREEN_CLIP) || (desktop->clip_flags & SET_CURSOR_CLIP))
++    {
++        x = max( min( desktop_shm->cursor.x, new_rect.right - 1 ), new_rect.left );
++        y = max( min( desktop_shm->cursor.y, new_rect.bottom - 1 ), new_rect.top );
++        if (x != desktop_shm->cursor.x || y != desktop_shm->cursor.y) set_cursor_pos( desktop, x, y );
++    }
+ 
+     /* request clip cursor rectangle reset to the desktop thread */
+     if (reset) post_desktop_message( desktop, WM_WINE_CLIPCURSOR, flags, FALSE );
+@@ -3254,6 +3262,7 @@ DECL_HANDLER(send_hardware_message)
+     switch (req->input.type)
+     {
+     case INPUT_MOUSE:
++        desktop->cursor_flags = origin == IMO_HARDWARE ? req->flags : 0;
+         wait = queue_mouse_message( desktop, req->win, &req->input, origin, sender, rawinput );
+         break;
+     case INPUT_KEYBOARD:
+@@ -4074,6 +4083,8 @@ DECL_HANDLER(set_cursor)
+     if (req->flags & SET_CURSOR_POS) set_cursor_pos( desktop, req->x, req->y );
+     if (req->flags & SET_CURSOR_CLIP) set_clip_rectangle( desktop, &req->clip, req->flags, 0 );
+     if (req->flags & SET_CURSOR_NOCLIP) set_clip_rectangle( desktop, NULL, SET_CURSOR_NOCLIP, 0 );
++    if (req->flags & SET_CURSOR_REAPPLY)
++        queue_cursor_message( desktop, 0, WM_WINE_CLIPCURSOR, desktop->clip_flags, FALSE );
+ 
+     new_cursor = input_shm->cursor_count < 0 ? 0 : input_shm->cursor;
+     if (prev_cursor != new_cursor) update_desktop_cursor_handle( desktop, input, new_cursor );
+diff --git a/server/user.h b/server/user.h
+index f1a1f07..e41e5c3 100644
+--- a/server/user.h
++++ b/server/user.h
+@@ -83,6 +83,7 @@ struct desktop
+     unsigned int         users;            /* processes and threads using this desktop */
+     unsigned char        alt_pressed;      /* last key press was Alt (used to determine msg on release) */
+     struct key_repeat    key_repeat;       /* key auto-repeat */
++    unsigned int         cursor_flags;     /* flags of the latest mouse input */
+     unsigned int         clip_flags;       /* last cursor clip flags */
+     user_handle_t        cursor_win;       /* window that contains the cursor */
+     desktop_shm_t       *shared;           /* desktop session shared memory */
+diff --git a/server/winstation.c b/server/winstation.c
+index e2aad1e..0279db2 100644
+--- a/server/winstation.c
++++ b/server/winstation.c
+@@ -280,6 +280,7 @@ static bool desktop_init( struct object *obj, const void *init_data )
+     desktop->foreground_input = NULL;
+     desktop->foreground_pid = 0;
+     desktop->users = 0;
++    desktop->cursor_flags = 0;
+     desktop->clip_flags = 0;
+     desktop->cursor_win = 0;
+     desktop->alt_pressed = 0;

@@ -1,0 +1,18 @@
+--- a/dlls/winewayland.drv/waylanddrv_main.c
++++ b/dlls/winewayland.drv/waylanddrv_main.c
+@@ -98,9 +98,12 @@
+ 
+     wayland_init_process_name();
+ 
+-    /* Opt in once, never query environment variables on the input path. */
+-    flstudio_compat = getenv("WINE_WAYLAND_FLSTUDIO") &&
+-                      !strcmp(getenv("WINE_WAYLAND_FLSTUDIO"), "1");
++    /* Enable FL compatibility on normal launches. Keep an override for
++     * diagnosis, read once rather than on the input or audio paths. */
++    flstudio_compat = process_name &&
++                      (!strcmp(process_name, "fl64.exe") || !strcmp(process_name, "fl.exe"));
++    if (getenv("WINE_WAYLAND_FLSTUDIO"))
++        flstudio_compat = !strcmp(getenv("WINE_WAYLAND_FLSTUDIO"), "1");
+     if (flstudio_compat) wayland_pointer_flags |= SEND_HWMSG_NO_VSCREEN_CLIP;
+ 
+     if (!wayland_process_init()) goto err;

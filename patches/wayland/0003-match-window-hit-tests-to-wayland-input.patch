@@ -1,0 +1,20 @@
+--- a/server/window.c
++++ b/server/window.c
+@@ -1080,7 +1080,16 @@
+         dpi = get_window_dpi( top->parent );
+     }
+ 
+-    if (!is_point_in_window( top, &x, &y, dpi )) return 1;
++    if (!is_point_in_window( top, &x, &y, dpi ))
++    {
++        /* Native Wayland surfaces may be visible outside the Windows desktop
++         * rectangle. Match driver input targeting when applications (e.g. JUCE)
++         * query WindowFromPoint there. is_point_in_window has mapped the point
++         * to desktop DPI; keep normal child visibility, regions and z-order. */
++        if (is_desktop_window( top ) && (top->desktop->cursor_flags & SEND_HWMSG_NO_VSCREEN_CLIP))
++            return get_window_children_from_point( top, x, y, array );
++        return 1;
++    }
+     /* if point is in client area, and window is not minimized or disabled, check children */
+     if (!(top->style & (WS_MINIMIZE|WS_DISABLED)) && point_in_rect( &top->client_rect, x, y ))
+     {

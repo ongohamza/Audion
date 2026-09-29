@@ -56,7 +56,8 @@ On Arch, missing basic tools can be installed with:
 ```bash
 sudo pacman -S --needed base-devel git cmake python perl autoconf automake \
   flex bison pkgconf mingw-w64-gcc libpipewire freetype2 libx11 libxext \
-  libxrender libxrandr libxi libxcursor libxfixes libglvnd alsa-lib libpulse gnutls
+  libxrender libxrandr libxi libxcursor libxfixes libglvnd alsa-lib libpulse gnutls \
+  wayland wayland-protocols libxkbcommon
 ```
 
 This does **not** install Arch Wine. Configure detects additional optional Wine
@@ -75,10 +76,10 @@ pacman-managed package. Keep the source/build folder for future maintenance.
 2. Wine Staging v11.18: `627ccf4f350f41c6cea57fda05f52e57ba9fab1f`, all Staging patches.
 3. Audion patches: two signature patches, the 11.18-context OpenGL patch,
    Effectrix deletion protection, its always-on follow-up, and the Nexus
-   Direct2D/completed-frame follow-ups listed in the manifest.
+   Direct2D/completed-frame and FL Studio Wayland input follow-ups listed in the manifest.
 4. Regenerate configure and server protocol files; configure with
    `--prefix=/usr/local --libdir=/usr/local/lib --enable-archs=x86_64,i386`.
-5. Build Wine using `make -j"$(nproc)"`, then install it.
+5. Build Wine using `make -j"$AUDION_JOBS"` (default 8), then install it.
 6. Build PipeASIO v1.7.0 (`bb7911e0e7590a76c11b9b9843735fb116b9c1bf`), explicitly using
    `/usr/local/bin/winebuild`, `/usr/local/bin/winegcc`, `/usr/local/include/wine` and `/usr/local/lib/wine`.
    Run its non-integration tests, install, and optionally register.
@@ -92,6 +93,33 @@ Wine's large standalone regression-test executables are not built
 The 11.18 OpenGL patch has the same logic as the 11.16 patch. Its first context
 line was adapted to Wine's new designated structure initializer. Use this
 build script for 11.18 Staging; `apply-patches.sh` remains pinned to 11.16.
+
+## Native Wayland and synchronization
+
+FL Studio's Wayland fixes are enabled automatically for `FL64.exe` and `FL.exe`.
+They apply to the host window/input path, not a plugin-name whitelist. The Nexus
+follow-up repairs `WindowFromPoint` beyond the Windows desktop rectangle; see
+[scope and verification](FLSTUDIO_WAYLAND.md). An optional
+`WINE_WAYLAND_FLSTUDIO=0` override disables compatibility for diagnosis.
+
+To select native Wayland for an existing FL prefix, with Wine applications closed:
+
+```bash
+WINEPREFIX="$HOME/.wine" /usr/local/bin/wine reg add 'HKCU\Software\Wine\Drivers' \
+  /v Graphics /t REG_SZ /d wayland,x11 /f
+```
+
+Launch without forcing a synchronization backend:
+
+```bash
+env -u DISPLAY -u WINEFSYNC -u WINEESYNC WINEPREFIX="$HOME/.wine" WINEDEBUG=-all \
+  /usr/local/bin/wine 'C:\Program Files\Image-Line\FL Studio 2026\FL64.exe'
+```
+
+The graphics choice persists in the prefix, and FL compatibility needs no launch
+variable. Ntsync uses Wine's normal selection when kernel support is available.
+The build does not change PipeWire buffer sizes, realtime priorities, or kernel
+settings. Set `AUDION_JOBS=8` (or fewer) to limit build load.
 
 ## Launch the installed Wine explicitly
 

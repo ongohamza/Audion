@@ -41,13 +41,23 @@ for path in "${touched[@]}"; do
         index_git add -- "$path"
     fi
 done
+# Peel applied follow-ups in reverse order so an overlapping later patch does
+# not prevent recognizing its prerequisite on a resumed build.
 pending=()
-for patch in "${patches[@]}"; do
+declare -A present=()
+for ((i=${#patches[@]}-1; i>=0; --i)); do
+    patch=${patches[i]}
     if index_git apply --cached --reverse --check "$patch" 2>/dev/null; then
+        index_git apply --cached --reverse "$patch"
+        present["$patch"]=1
+    fi
+done
+for patch in "${patches[@]}"; do
+    index_git apply --cached --check "$patch" || die "Patch conflicts: $patch; no source files changed."
+    index_git apply --cached "$patch"
+    if [[ ${present["$patch"]:-0} == 1 ]]; then
         echo "Already applied: $(basename "$patch")"
     else
-        index_git apply --cached --check "$patch" || die "Patch conflicts: $patch; no source files changed."
-        index_git apply --cached "$patch"
         pending+=("$patch")
     fi
 done
