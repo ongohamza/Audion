@@ -139,8 +139,9 @@ Launch with explicit settings so a different working directory cannot silently
 disable the required options:
 
 ```bash
+env -u DISPLAY -u WINEFSYNC -u WINEESYNC -u WINE_DCOMP_GPU \
 DXVK_CONFIG='dxgi.enableDummyCompositionSwapchain = True; d3d11.enableContextLock = True' \
-WINEDLLOVERRIDES='d3d11,dxgi=n;d2d1,dcomp=b' \
+WINEDLLOVERRIDES='d3d11,dxgi=n;d2d1,dcomp=b' WINEDEBUG=-all \
 /usr/local/bin/wine "$WINEPREFIX/drive_c/Program Files/Image-Line/FL Studio 2026/FL64.exe"
 ```
 
@@ -182,7 +183,48 @@ unchanged. These are whole-test-process CPU measurements, not measured Nexus inp
 latency, compositor frame-rate measurements, or audio/xrun results. See
 [verification](verification/2026-09-29-composition-performance.md).
 
-One synchronous GPU readback remains for each newly composed frame, as does the
-GDI blend into the HWND. This is not zero-copy presentation and does not establish
-that Nexus routing-graph dragging now matches its software renderer. A GPU-only
-compositor needs a separate design for alpha blending, child windows and fallback.
+Those measurements describe the GDI fallback, which still reads back each new
+frame. The subsequent GPU path below avoids readback for eligible Nexus editors.
+
+
+## GPU presentation and geometry performance (2026-09-29)
+
+The user confirmed the final clean candidate fixed Nexus routing-graph dragging:
+“fixed, looks good.” Earlier candidates that only cached resources, removed
+readback, or changed waiting policy did not resolve the visible lag. Profiling
+then identified expensive Direct2D geometry preparation.
+
+The complete stack now includes:
+
+- An automatic GPU presentation path for Nexus-owned JUCE windows with one
+  eligible root visual. It copies immutable snapshots into an HWND swapchain,
+  without CPU readback. Complex targets, transparent generic windows and child
+  window arrangements keep the GDI fallback. This is not zero-copy composition.
+- A hidden composition producer no longer waits for its dummy window's v-sync.
+  Normal HWND presentation retains requested v-sync and frame-latency fences.
+- With the dummy-composition option enabled, `WaitForVBlank` sleeps to its
+  existing approximate deadline instead of busy-waiting. This affects all output
+  vblank waits using that factory, not only the hidden producer. Other DXVK
+  configurations keep their existing policy.
+- Direct2D indexes potentially intersecting path segments and relevant outline
+  edges instead of scanning every segment for every query. Exact intersection
+  routines, original pair order and fill rules are preserved. Small paths,
+  dense candidate sets, nonfinite coordinates and allocation failures retain
+  the original algorithms.
+
+The GPU path is automatic for window classes owned by `Nexus.vst3` or
+`Nexus.dll`; no experimental opt-in is needed. `WINE_DCOMP_GPU=0` is available
+for diagnostic fallback. Remove a previously set `WINE_DCOMP_GPU=0` before
+launching the final version. `WINE_DCOMP_GPU=1` additionally permits generic
+opaque test targets; it is not needed for Nexus. Do not add a global
+`dxgi.syncInterval=0` workaround.
+
+The existing build/install commands include the new patches. Native Wayland
+launches unset `DISPLAY`; clearing old `WINEFSYNC`/`WINEESYNC` overrides does not
+force fsync and leaves the existing ntsync setup intact. No audio thread,
+PipeASIO buffer, realtime priority, kernel or timer-resolution setting is
+changed. No audio-latency or xrun improvement is claimed.
+
+See the [performance verification](verification/2026-09-29-composition-performance.md)
+for the measured changes and remaining coverage limits. Full DirectComposition
+support and every plugin/GPU combination remain outside this scoped fix.

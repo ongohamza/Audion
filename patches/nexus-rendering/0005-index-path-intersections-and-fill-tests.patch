@@ -1,0 +1,356 @@
+diff --git a/dlls/d2d1/geometry.c b/dlls/d2d1/geometry.c
+index b6903d0..c432800 100644
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -2140,8 +2140,134 @@ static BOOL d2d_path_geometry_point_inside(const struct d2d_geometry *geometry,
+     return geometry->u.path.fill_mode == D2D1_FILL_MODE_ALTERNATE ? score & 1 : score;
+ }
+ 
++#define D2D_FILL_BUCKET_COUNT 64
++struct d2d_fill_edge
++{
++    const struct d2d_figure *figure;
++    const D2D1_POINT_2F *p0, *p1;
++};
++struct d2d_fill_index
++{
++    struct d2d_fill_edge *edges;
++    size_t *entries;
++    size_t offsets[D2D_FILL_BUCKET_COUNT + 1];
++    double top, height;
++};
++
++static unsigned int d2d_fill_bucket(const struct d2d_fill_index *index, float y)
++{
++    double bucket = ((double)y - index->top) / index->height * D2D_FILL_BUCKET_COUNT;
++    return bucket <= 0.0 ? 0 : bucket >= D2D_FILL_BUCKET_COUNT - 1
++            ? D2D_FILL_BUCKET_COUNT - 1 : (unsigned int)bucket;
++}
++
++/* Only used for triangle classification, after all path edits are complete. */
++static void d2d_fill_index_init(struct d2d_fill_index *index, const struct d2d_geometry *geometry)
++{
++    size_t count = 0, n = 0, total = 0, i, j, positions[D2D_FILL_BUCKET_COUNT];
++    unsigned int first, last, bucket;
++    const struct d2d_figure *figure;
++    struct d2d_fill_edge *edge;
++    double bottom = -DBL_MAX;
++
++    index->top = DBL_MAX;
++    for (i = 0; i < geometry->u.path.figure_count; ++i)
++    {
++        figure = &geometry->u.path.figures[i];
++        if (figure->vertex_count > SIZE_MAX - count)
++            return;
++        count += figure->vertex_count;
++        for (j = 0; j < figure->vertex_count; ++j)
++        {
++            if (!isfinite(figure->vertices[j].x) || !isfinite(figure->vertices[j].y))
++                return;
++            index->top = min(index->top, figure->vertices[j].y);
++            bottom = max(bottom, figure->vertices[j].y);
++        }
++    }
++    index->height = bottom - index->top;
++    if (count < 64 || index->height <= 0.0 || !isfinite(index->height)
++            || count > SIZE_MAX / sizeof(*index->edges)
++            || !(index->edges = malloc(count * sizeof(*index->edges))))
++        return;
++
++    for (i = 0; i < geometry->u.path.figure_count; ++i)
++    {
++        figure = &geometry->u.path.figures[i];
++        for (j = 0; j < figure->vertex_count; ++j)
++        {
++            edge = &index->edges[n++];
++            edge->figure = figure;
++            edge->p0 = &figure->vertices[j ? j - 1 : figure->vertex_count - 1];
++            edge->p1 = &figure->vertices[j];
++            first = d2d_fill_bucket(index, min(edge->p0->y, edge->p1->y));
++            last = d2d_fill_bucket(index, max(edge->p0->y, edge->p1->y));
++            /* Bound temporary storage; dense paths use the original scan. */
++            if (total > 1048576 - (last - first + 1))
++                goto fail;
++            total += last - first + 1;
++            for (bucket = first; bucket <= last; ++bucket)
++                ++index->offsets[bucket + 1];
++        }
++    }
++    if (!(index->entries = malloc(total * sizeof(*index->entries))))
++        goto fail;
++    for (bucket = 0; bucket < D2D_FILL_BUCKET_COUNT; ++bucket)
++    {
++        index->offsets[bucket + 1] += index->offsets[bucket];
++        positions[bucket] = index->offsets[bucket];
++    }
++    for (i = 0; i < n; ++i)
++    {
++        edge = &index->edges[i];
++        first = d2d_fill_bucket(index, min(edge->p0->y, edge->p1->y));
++        last = d2d_fill_bucket(index, max(edge->p0->y, edge->p1->y));
++        for (bucket = first; bucket <= last; ++bucket)
++            index->entries[positions[bucket]++] = i;
++    }
++    return;
++
++fail:
++    free(index->edges);
++    index->edges = NULL;
++}
++
++static BOOL d2d_fill_index_contains(const struct d2d_fill_index *index,
++        const struct d2d_geometry *geometry, const D2D1_POINT_2F *probe)
++{
++    unsigned int bucket, score = 0;
++    const struct d2d_fill_edge *edge;
++    D2D1_POINT_2F v_p, v_probe;
++    const D2D1_RECT_F *bounds;
++    size_t i;
++
++    if (!index->entries || !isfinite(probe->y))
++        return d2d_path_geometry_point_inside(geometry, probe, TRUE);
++    bucket = d2d_fill_bucket(index, probe->y);
++    for (i = index->offsets[bucket]; i < index->offsets[bucket + 1]; ++i)
++    {
++        edge = &index->edges[index->entries[i]];
++        bounds = &edge->figure->bounds;
++        if (probe->x < bounds->left || probe->x > bounds->right
++                || probe->y < bounds->top || probe->y > bounds->bottom)
++            continue;
++        if ((probe->y < edge->p0->y) == (probe->y < edge->p1->y))
++            continue;
++        d2d_point_subtract(&v_p, edge->p1, edge->p0);
++        d2d_point_subtract(&v_probe, probe, edge->p0);
++        if (v_probe.x < v_p.x * (v_probe.y / v_p.y))
++        {
++            if (geometry->u.path.fill_mode == D2D1_FILL_MODE_ALTERNATE || probe->y < edge->p0->y)
++                ++score;
++            else
++                --score;
++        }
++    }
++    return geometry->u.path.fill_mode == D2D1_FILL_MODE_ALTERNATE ? score & 1 : score;
++}
++
+ static BOOL d2d_path_geometry_add_fill_face(struct d2d_geometry *geometry, const struct d2d_cdt *cdt,
+-        const struct d2d_cdt_edge_ref *base_edge)
++        const struct d2d_cdt_edge_ref *base_edge, const struct d2d_fill_index *index)
+ {
+     struct d2d_cdt_edge_ref tmp;
+     struct d2d_face *face;
+@@ -2180,7 +2306,7 @@ static BOOL d2d_path_geometry_add_fill_face(struct d2d_geometry *geometry, const
+     probe.x += cdt->vertices[d2d_cdt_edge_origin(cdt, &tmp)].x * 0.50f;
+     probe.y += cdt->vertices[d2d_cdt_edge_origin(cdt, &tmp)].y * 0.50f;
+ 
+-    if (d2d_cdt_leftof(cdt, face->v[2], base_edge) && d2d_path_geometry_point_inside(geometry, &probe, TRUE))
++    if (d2d_cdt_leftof(cdt, face->v[2], base_edge) && d2d_fill_index_contains(index, geometry, &probe))
+         ++geometry->fill.face_count;
+ 
+     return TRUE;
+@@ -2190,6 +2316,9 @@ static BOOL d2d_cdt_generate_faces(const struct d2d_cdt *cdt, struct d2d_geometr
+ {
+     struct d2d_cdt_edge_ref base_edge;
+     size_t i;
++    struct d2d_fill_index index = {0};
++
++    d2d_fill_index_init(&index, geometry);
+ 
+     for (i = 0; i < cdt->edge_count; ++i)
+     {
+@@ -2198,16 +2327,20 @@ static BOOL d2d_cdt_generate_faces(const struct d2d_cdt *cdt, struct d2d_geometr
+ 
+         base_edge.idx = i;
+         base_edge.r = 0;
+-        if (!d2d_path_geometry_add_fill_face(geometry, cdt, &base_edge))
++        if (!d2d_path_geometry_add_fill_face(geometry, cdt, &base_edge, &index))
+             goto fail;
+         d2d_cdt_edge_sym(&base_edge, &base_edge);
+-        if (!d2d_path_geometry_add_fill_face(geometry, cdt, &base_edge))
++        if (!d2d_path_geometry_add_fill_face(geometry, cdt, &base_edge, &index))
+             goto fail;
+     }
+ 
++    free(index.edges);
++    free(index.entries);
+     return TRUE;
+ 
+ fail:
++    free(index.edges);
++    free(index.entries);
+     free(geometry->fill.faces);
+     geometry->fill.faces = NULL;
+     geometry->fill.faces_size = 0;
+@@ -2723,7 +2856,7 @@ static BOOL d2d_geometry_apply_intersections(struct d2d_geometry *geometry,
+ /* Intersect the geometry's segments with themselves. This uses the
+  * straightforward approach of testing everything against everything, but
+  * there certainly exist more scalable algorithms for this. */
+-static BOOL d2d_geometry_intersect_self(struct d2d_geometry *geometry)
++static BOOL d2d_geometry_intersect_self_brute_force(struct d2d_geometry *geometry)
+ {
+     struct d2d_geometry_intersections intersections = {0};
+     const struct d2d_figure *figure_p, *figure_q;
+@@ -2808,6 +2941,164 @@ done:
+     return ret;
+ }
+ 
++struct d2d_bounded_segment
++{
++    struct d2d_segment_idx idx;
++    D2D1_RECT_F bounds;
++    BOOL bezier;
++};
++
++static int __cdecl d2d_bounded_segment_compare(const void *a, const void *b)
++{
++    const struct d2d_bounded_segment *p = a, *q = b;
++
++    if (p->bounds.left != q->bounds.left)
++        return p->bounds.left < q->bounds.left ? -1 : 1;
++    if (p->idx.figure_idx != q->idx.figure_idx)
++        return p->idx.figure_idx < q->idx.figure_idx ? -1 : 1;
++    return p->idx.vertex_idx < q->idx.vertex_idx ? -1 : p->idx.vertex_idx != q->idx.vertex_idx;
++}
++
++struct d2d_segment_pair
++{
++    const struct d2d_bounded_segment *p, *q;
++};
++
++static int __cdecl d2d_segment_pair_compare(const void *a, const void *b)
++{
++    const struct d2d_segment_pair *p = a, *q = b;
++
++    if (p->p->idx.figure_idx != q->p->idx.figure_idx)
++        return p->p->idx.figure_idx < q->p->idx.figure_idx ? -1 : 1;
++    if (p->p->idx.vertex_idx != q->p->idx.vertex_idx)
++        return p->p->idx.vertex_idx < q->p->idx.vertex_idx ? -1 : 1;
++    if (p->q->idx.figure_idx != q->q->idx.figure_idx)
++        return p->q->idx.figure_idx < q->q->idx.figure_idx ? -1 : 1;
++    return p->q->idx.vertex_idx < q->q->idx.vertex_idx ? -1 : p->q->idx.vertex_idx != q->q->idx.vertex_idx;
++}
++
++/* Sort conservative segment bounds along x, then only test overlapping pairs.
++ * Restore original pair order before testing, including ties between rounded
++ * intersection parameters. Dense paths retain the bounded-memory old method. */
++static BOOL d2d_geometry_intersect_self(struct d2d_geometry *geometry)
++{
++    struct d2d_geometry_intersections intersections = {0};
++    struct d2d_bounded_segment *segments, *s;
++    struct d2d_segment_pair *pairs;
++    size_t pair_count = 0, max_pairs;
++    const struct d2d_bounded_segment *p, *q, *tmp;
++    const struct d2d_figure *figure;
++    const D2D1_POINT_2F *points[3];
++    size_t count = 0, capacity = 0, i, j, k, c, n;
++    BOOL ret = FALSE;
++
++    for (i = 0; i < geometry->u.path.figure_count; ++i)
++    {
++        if (geometry->u.path.figures[i].vertex_count > SIZE_MAX - capacity)
++            return d2d_geometry_intersect_self_brute_force(geometry);
++        capacity += geometry->u.path.figures[i].vertex_count;
++    }
++    if (capacity < 32 || capacity > SIZE_MAX / sizeof(*segments)
++            || !(segments = malloc(capacity * sizeof(*segments))))
++        return d2d_geometry_intersect_self_brute_force(geometry);
++
++    for (i = 0; i < geometry->u.path.figure_count; ++i)
++    {
++        figure = &geometry->u.path.figures[i];
++        for (j = 0, c = 0; j < figure->vertex_count; ++j)
++        {
++            if (figure->vertex_types[j] == D2D_VERTEX_TYPE_END)
++                continue;
++            s = &segments[count++];
++            s->idx.figure_idx = i;
++            s->idx.vertex_idx = j;
++            s->idx.control_idx = c;
++            s->bezier = d2d_vertex_type_is_bezier(figure->vertex_types[j]);
++            points[0] = &figure->vertices[j];
++            points[1] = &figure->vertices[j + 1 == figure->vertex_count ? 0 : j + 1];
++            n = 2;
++            if (s->bezier)
++                points[n++] = &figure->bezier_controls[c++];
++            s->bounds.left = s->bounds.right = points[0]->x;
++            s->bounds.top = s->bounds.bottom = points[0]->y;
++            for (k = 0; k < n; ++k)
++            {
++                if (!isfinite(points[k]->x) || !isfinite(points[k]->y))
++                {
++                    free(segments);
++                    return d2d_geometry_intersect_self_brute_force(geometry);
++                }
++                s->bounds.left = min(s->bounds.left, points[k]->x);
++                s->bounds.right = max(s->bounds.right, points[k]->x);
++                s->bounds.top = min(s->bounds.top, points[k]->y);
++                s->bounds.bottom = max(s->bounds.bottom, points[k]->y);
++            }
++        }
++    }
++
++    max_pairs = count > 65536 ? 1048576 : count * 16;
++    if (!(pairs = malloc(max_pairs * sizeof(*pairs))))
++    {
++        free(segments);
++        return d2d_geometry_intersect_self_brute_force(geometry);
++    }
++    qsort(segments, count, sizeof(*segments), d2d_bounded_segment_compare);
++    for (i = 0; i < count; ++i)
++    {
++        for (j = i + 1; j < count && segments[j].bounds.left <= segments[i].bounds.right; ++j)
++        {
++            p = &segments[i];
++            q = &segments[j];
++            if (p->bounds.top > q->bounds.bottom || p->bounds.bottom < q->bounds.top)
++                continue;
++            if (p->idx.figure_idx != q->idx.figure_idx
++                    && !d2d_rect_check_overlap(&geometry->u.path.figures[p->idx.figure_idx].bounds,
++                            &geometry->u.path.figures[q->idx.figure_idx].bounds))
++                continue;
++            if (p->idx.figure_idx < q->idx.figure_idx
++                    || (p->idx.figure_idx == q->idx.figure_idx && p->idx.vertex_idx < q->idx.vertex_idx))
++            {
++                tmp = p;
++                p = q;
++                q = tmp;
++            }
++            if (pair_count == max_pairs)
++            {
++                free(pairs);
++                free(segments);
++                return d2d_geometry_intersect_self_brute_force(geometry);
++            }
++            pairs[pair_count].p = p;
++            pairs[pair_count++].q = q;
++        }
++    }
++    qsort(pairs, pair_count, sizeof(*pairs), d2d_segment_pair_compare);
++    for (i = 0; i < pair_count; ++i)
++    {
++        p = pairs[i].p;
++        q = pairs[i].q;
++        if (p->bezier && q->bezier)
++            ret = d2d_geometry_intersect_bezier_bezier(geometry, &intersections,
++                    &p->idx, 0.0f, 1.0f, &q->idx, 0.0f, 1.0f);
++        else if (p->bezier || q->bezier)
++            ret = d2d_geometry_intersect_bezier_line(geometry, &intersections,
++                    p->bezier ? &p->idx : &q->idx, p->bezier ? &q->idx : &p->idx);
++        else
++            ret = d2d_geometry_intersect_line_line(geometry, &intersections, &p->idx, &q->idx);
++        if (!ret)
++            goto done;
++    }
++    qsort(intersections.intersections, intersections.intersection_count,
++            sizeof(*intersections.intersections), d2d_geometry_intersections_compare);
++    ret = d2d_geometry_apply_intersections(geometry, &intersections);
++
++done:
++    free(intersections.intersections);
++    free(pairs);
++    free(segments);
++    return ret;
++}
++
+ static HRESULT d2d_path_geometry_triangulate(struct d2d_geometry *geometry)
+ {
+     struct d2d_cdt_edge_ref left_edge, right_edge;

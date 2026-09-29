@@ -4,3 +4,5 @@ patches/dxvk/0003-lock-context-state-swap.patch
 patches/dxvk/0004-lock-unmap-entry.patch
 patches/dxvk/0005-lock-import-allocation-pool.patch
 patches/dxvk/0006-cache-completed-frame-snapshots.patch
+patches/dxvk/0007-avoid-hidden-composition-vsync.patch
+patches/dxvk/0008-sleep-during-composition-vblank-waits.patch

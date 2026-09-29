@@ -1,0 +1,18 @@
+diff --git a/src/dxgi/dxgi_swapchain.cpp b/src/dxgi/dxgi_swapchain.cpp
+index 1b82930..119cdff 100644
+--- a/src/dxgi/dxgi_swapchain.cpp
++++ b/src/dxgi/dxgi_swapchain.cpp
+@@ -388,6 +388,13 @@ namespace dxvk {
+     if (options->syncInterval >= 0)
+       SyncInterval = options->syncInterval;
+ 
++    // A composition producer is not displayed through its hidden dummy HWND.
++    // Waiting for that HWND's v-sync can stall Wayland frame callbacks (and
++    // the frame-latency semaphore) for hundreds of milliseconds. The actual
++    // compositor target owns display pacing; keep normal HWND chains unchanged.
++    if (!m_window && options->enableDummyCompositionSwapchain)
++      SyncInterval = 0;
++
+     UpdateGlobalHDRState();
+ 
+     if (!(PresentFlags & DXGI_PRESENT_TEST))

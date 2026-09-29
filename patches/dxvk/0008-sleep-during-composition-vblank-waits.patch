@@ -1,0 +1,24 @@
+diff --git a/src/dxgi/dxgi_output.cpp b/src/dxgi/dxgi_output.cpp
+index 8814f5c..ca17421 100644
+--- a/src/dxgi/dxgi_output.cpp
++++ b/src/dxgi/dxgi_output.cpp
+@@ -487,8 +487,17 @@ namespace dxvk {
+ 
+     m_monitorInfo->ReleaseMonitorData();
+ 
+-    // Sleep until the given time point
+-    Sleep::sleepUntil(t1, t2);
++    // Composition clients use this approximate vblank clock to schedule GUI
++    // updates. Do not spend the tail of every refresh busy-waiting alongside
++    // realtime audio threads. Keep the default timing policy for other users.
++    if (m_factory->GetOptions()->enableDummyCompositionSwapchain) {
++      while (t1 < t2) {
++        std::this_thread::sleep_for(t2 - t1);
++        t1 = dxvk::high_resolution_clock::now();
++      }
++    } else {
++      Sleep::sleepUntil(t1, t2);
++    }
+     return S_OK;
+   }
+   

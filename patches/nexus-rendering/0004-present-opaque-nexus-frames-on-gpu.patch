@@ -1,0 +1,266 @@
+diff --git a/dlls/dcomp/dcomp_private.h b/dlls/dcomp/dcomp_private.h
+index f4358e3..6ec82f2 100644
+--- a/dlls/dcomp/dcomp_private.h
++++ b/dlls/dcomp/dcomp_private.h
+@@ -22,6 +22,7 @@
+ #include "dcomp_private_iface.h"
+ #include "d2d1_1.h"
+ #include <d3d11_1.h>
++#include <dxgi1_2.h>
+ #include "wine/list.h"
+ 
+ struct composition_device
+@@ -66,6 +67,13 @@ struct composition_target
+     IDCompositionTarget IDCompositionTarget_iface;
+     IDCompositionDevice *device;
+     IDCompositionVisual *root;
++    IDXGISwapChain1 *gpu_swapchain;
++    struct composition_visual *gpu_visual;
++    IUnknown *gpu_content;
++    UINT gpu_width, gpu_height;
++    DXGI_FORMAT gpu_format;
++    UINT64 gpu_serial;
++    BOOL gpu_valid;
+     BOOL topmost;
+     HWND hwnd;
+     HANDLE shared_visual_handle;
+@@ -78,6 +86,7 @@ struct composition_visual
+     IDCompositionVisualUnknown IDCompositionVisualUnknown_iface;
+     ID2D1GdiInteropRenderTarget *interop;
+     ID2D1DeviceContext *device_context;
++    struct composition_target *gpu_target;
+     /* Private compositor resources, never exposed to the application. */
+     ID2D1Bitmap1 *composition_bitmap;
+     ID3DDeviceContextState *composition_state;
+@@ -143,6 +152,7 @@ static inline struct composition_visual *impl_from_IDCompositionVisualUnknown(ID
+     return CONTAINING_RECORD(iface, struct composition_visual, IDCompositionVisualUnknown_iface);
+ }
+ 
++void composition_target_clear_gpu(struct composition_target *target);
+ void composition_visual_clear_cache(struct composition_visual *visual);
+ void dcomp_lock(void);
+ void dcomp_unlock(void);
+diff --git a/dlls/dcomp/device.c b/dlls/dcomp/device.c
+index c1b3c8c..0cbd910 100644
+--- a/dlls/dcomp/device.c
++++ b/dlls/dcomp/device.c
+@@ -141,6 +141,7 @@ static ULONG STDMETHODCALLTYPE device_Release(IDCompositionDevice *iface)
+ void composition_visual_clear_cache(struct composition_visual *visual)
+ {
+     static const RECT empty_rect;
++    if (visual->gpu_target) composition_target_clear_gpu(visual->gpu_target);
+     if (visual->composition_dc)
+     {
+         ID2D1GdiInteropRenderTarget_ReleaseDC(visual->interop, &empty_rect);
+@@ -289,7 +290,139 @@ static struct composition_visual * shared_visual_target_get_root(HANDLE shared_v
+     return visual;
+ }
+ 
+-static HRESULT do_composite(const struct composition_target *target, struct composition_visual *visual)
++void composition_target_clear_gpu(struct composition_target *target)
++{
++    if (target->gpu_visual) target->gpu_visual->gpu_target = NULL;
++    target->gpu_visual = NULL;
++    if (target->gpu_content) IUnknown_Release(target->gpu_content);
++    target->gpu_content = NULL;
++    if (target->gpu_swapchain) IDXGISwapChain1_Release(target->gpu_swapchain);
++    target->gpu_swapchain = NULL;
++    target->gpu_valid = FALSE;
++}
++
++/* JUCE's swapchain-based editor renderer is opaque. Limit the compatibility
++ * exception to Nexus's own JUCE window class; a non-layered HWND alone does not
++ * prove that arbitrary DirectComposition content is opaque. */
++static BOOL composition_gpu_allowed(struct composition_target *target, struct composition_visual *visual)
++{
++    WCHAR name[64], module[MAX_PATH], *basename;
++    IDXGISwapChain1 *content;
++    DXGI_SWAP_CHAIN_DESC1 desc;
++    char option[2] = {0};
++    BOOL nexus = FALSE;
++    DWORD length;
++
++    length = GetEnvironmentVariableA("WINE_DCOMP_GPU", option, sizeof(option));
++    if (length && option[0] == '0') return FALSE;
++    if (GetClassNameW(target->hwnd, name, ARRAY_SIZE(name)) && !wcsncmp(name, L"JUCE_", 5))
++    {
++        length = GetModuleFileNameW((HMODULE)GetClassLongPtrW(target->hwnd, GCLP_HMODULE), module,
++                                   ARRAY_SIZE(module));
++        if (length && length < ARRAY_SIZE(module))
++        {
++            basename = wcsrchr(module, '\\');
++            basename = basename ? basename + 1 : module;
++            nexus = !wcsicmp(basename, L"Nexus.vst3") || !wcsicmp(basename, L"Nexus.dll");
++        }
++    }
++    if (nexus) return TRUE;
++    /* Explicit opt-in can enable other API-declared opaque content, but never
++     * silently discard alpha from arbitrary premultiplied composition content. */
++    if (option[0] != '1' || !IsEqualGUID(&visual->content_iid, &IID_IDXGISwapChain1)) return FALSE;
++    if (FAILED(IUnknown_QueryInterface(visual->content, &IID_IDXGISwapChain1, (void **)&content))) return FALSE;
++    length = SUCCEEDED(IDXGISwapChain1_GetDesc1(content, &desc)) && desc.AlphaMode == DXGI_ALPHA_MODE_IGNORE;
++    IDXGISwapChain1_Release(content);
++    return length;
++}
++
++static HRESULT composite_gpu(struct composition_target *target, struct composition_visual *visual,
++        IDXGISurface *surface, UINT64 serial)
++{
++    DXGI_SWAP_CHAIN_DESC1 sc_desc = {0};
++    DXGI_SURFACE_DESC desc;
++    ID3D11Device *device = NULL;
++    ID3D11DeviceContext *context = NULL;
++    ID3D11Resource *source = NULL;
++    ID3D11Texture2D *destination = NULL;
++    IDXGIDevice *dxgi_device = NULL;
++    IDXGIAdapter *adapter = NULL;
++    IDXGIFactory2 *factory = NULL;
++    RECT client;
++    HRESULT hr = S_FALSE;
++
++    if (!composition_gpu_allowed(target, visual)
++            || !target->root || impl_from_IDCompositionVisual(target->root) != visual
++            || !list_empty(&visual->child_visuals) || visual->shared_visual_handle || visual->offset_x
++            || (GetWindowLongW(target->hwnd, GWL_EXSTYLE) & WS_EX_LAYERED)
++            || GetWindow(target->hwnd, GW_CHILD)
++            || GetPropW(target->hwnd, target->topmost ? L"wine_window_non_topmost_composed"
++                                                    : L"wine_window_topmost_composed"))
++        goto done;
++    if (!IsWindowVisible(target->hwnd))
++    {
++        /* Force the first visible tick to submit again even if no new frame
++         * was produced while hidden. */
++        target->gpu_valid = FALSE;
++        return target->gpu_swapchain ? S_OK : S_FALSE;
++    }
++    if (FAILED(IDXGISurface_GetDesc(surface, &desc)) || !GetClientRect(target->hwnd, &client)
++            || desc.Width != client.right || desc.Height != client.bottom)
++        goto done;
++    if (target->gpu_swapchain && (target->gpu_visual != visual || target->gpu_content != visual->content
++            || target->gpu_width != desc.Width || target->gpu_height != desc.Height
++            || target->gpu_format != desc.Format))
++        composition_target_clear_gpu(target);
++    if (target->gpu_valid && target->gpu_serial == serial) return S_OK;
++
++    if (FAILED(hr = IDXGISurface_GetDevice(surface, &IID_ID3D11Device, (void **)&device))) goto done;
++    if (!target->gpu_swapchain)
++    {
++        if (FAILED(hr = ID3D11Device_QueryInterface(device, &IID_IDXGIDevice, (void **)&dxgi_device))) goto done;
++        if (FAILED(hr = IDXGIDevice_GetAdapter(dxgi_device, &adapter))) goto done;
++        if (FAILED(hr = IDXGIAdapter_GetParent(adapter, &IID_IDXGIFactory2, (void **)&factory))) goto done;
++        sc_desc.Width = desc.Width; sc_desc.Height = desc.Height; sc_desc.Format = desc.Format;
++        sc_desc.SampleDesc.Count = 1;
++        sc_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
++        sc_desc.BufferCount = 2;
++        sc_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
++        sc_desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
++        if (FAILED(hr = IDXGIFactory2_CreateSwapChainForHwnd(factory, (IUnknown *)device, target->hwnd,
++                &sc_desc, NULL, NULL, &target->gpu_swapchain))) goto done;
++        target->gpu_visual = visual;
++        target->gpu_content = visual->content;
++        IUnknown_AddRef(target->gpu_content);
++        visual->gpu_target = target;
++        target->gpu_width = desc.Width; target->gpu_height = desc.Height; target->gpu_format = desc.Format;
++        TRACE("GPU composition target created %p %ux%u.\n", target->hwnd, desc.Width, desc.Height);
++    }
++    if (FAILED(hr = IDXGISurface_QueryInterface(surface, &IID_ID3D11Resource, (void **)&source))) goto done;
++    if (FAILED(hr = IDXGISwapChain1_GetBuffer(target->gpu_swapchain, 0, &IID_ID3D11Texture2D,
++            (void **)&destination))) goto done;
++    ID3D11Device_GetImmediateContext(device, &context);
++    ID3D11DeviceContext_CopyResource(context, (ID3D11Resource *)destination, source);
++    /* CopyResource leaves pipeline state alone. Do not hold a context lock over
++     * Present, which must acquire its own swapchain buffer lock first. */
++    hr = IDXGISwapChain1_Present(target->gpu_swapchain, 0, 0);
++    if (hr == S_OK)
++    {
++        target->gpu_valid = TRUE;
++        target->gpu_serial = serial;
++        TRACE("GPU composition presented serial %s.\n", wine_dbgstr_longlong(serial));
++    }
++done:
++    if (destination) ID3D11Texture2D_Release(destination);
++    if (source) ID3D11Resource_Release(source);
++    if (context) ID3D11DeviceContext_Release(context);
++    if (device) ID3D11Device_Release(device);
++    if (factory) IDXGIFactory2_Release(factory);
++    if (adapter) IDXGIAdapter_Release(adapter);
++    if (dxgi_device) IDXGIDevice_Release(dxgi_device);
++    if (hr != S_OK) composition_target_clear_gpu(target);
++    return hr;
++}
++
++static HRESULT do_composite(struct composition_target *target, struct composition_visual *visual)
+ {
+     struct composition_visual *child_visual;
+     IDXGISurface *dxgi_surface;
+@@ -379,7 +512,9 @@ static HRESULT do_composite(const struct composition_target *target, struct comp
+             return E_FAIL;
+         }
+ 
+-        hr = do_composite_dxgi_surface(target, visual, dxgi_surface, context_lock_forced, serial);
++        hr = context_lock_forced ? composite_gpu(target, visual, dxgi_surface, serial) : S_FALSE;
++        if (hr != S_OK)
++            hr = do_composite_dxgi_surface(target, visual, dxgi_surface, context_lock_forced, serial);
+         IDXGISurface_Release(dxgi_surface);
+         if (FAILED(hr)) WARN("Composition failed, retrying next frame: %#lx.\n", hr);
+     }
+@@ -401,8 +536,8 @@ static DWORD WINAPI composite_thread_proc(void *iface)
+     struct composition_target *target;
+     struct composition_visual *visual;
+     HDC hdc;
+-    LARGE_INTEGER clock_frequency, started, now;
+-    LONGLONG period, remaining;
++    LARGE_INTEGER clock_frequency, now;
++    LONGLONG period, remaining, deadline;
+ 
+     /* TODO: Implement and use D3DKMTWaitForVerticalBlankEvent() */
+     hdc = GetDC(0);
+@@ -411,10 +546,11 @@ static DWORD WINAPI composite_thread_proc(void *iface)
+     QueryPerformanceFrequency(&clock_frequency);
+     period = clock_frequency.QuadPart / frequency;
+     ReleaseDC(0, hdc);
++    QueryPerformanceCounter(&now);
++    deadline = now.QuadPart;
+ 
+     while (TRUE)
+     {
+-        QueryPerformanceCounter(&started);
+         dcomp_lock();
+ 
+         count = 0;
+@@ -450,9 +586,12 @@ static DWORD WINAPI composite_thread_proc(void *iface)
+             break;
+ 
+         QueryPerformanceCounter(&now);
+-        remaining = period - (now.QuadPart - started.QuadPart);
+-        /* Include rendering in the budget, round sleeps up, and yield under
+-         * overload. Do not raise timer resolution or audio thread priorities. */
++        deadline += period;
++        remaining = deadline - now.QuadPart;
++        if (remaining <= 0) deadline = now.QuadPart;
++        /* Keep an absolute cadence so rounding Sleep up does not accumulate
++         * one millisecond of drift per frame. Skip missed deadlines and yield
++         * under overload, without changing timer resolution or priorities. */
+         Sleep(remaining > 0 ? (remaining * 1000 + clock_frequency.QuadPart - 1)
+                 / clock_frequency.QuadPart : 1);
+     }
+diff --git a/dlls/dcomp/target.c b/dlls/dcomp/target.c
+index a8b6fab..0950685 100644
+--- a/dlls/dcomp/target.c
++++ b/dlls/dcomp/target.c
+@@ -71,6 +71,7 @@ static ULONG STDMETHODCALLTYPE target_Release(IDCompositionTarget *iface)
+         RemovePropW(target->hwnd, prop);
+ 
+         dcomp_lock();
++        composition_target_clear_gpu(target);
+         list_remove(&target->entry);
+         dcomp_unlock();
+         IDCompositionDevice_Release(target->device);
+@@ -133,6 +134,7 @@ static HRESULT STDMETHODCALLTYPE target_SetRoot(IDCompositionTarget *iface,
+         composition_visual->is_root = FALSE;
+         IDCompositionVisual_Release(target->root);
+     }
++    composition_target_clear_gpu(target);
+     target->root = visual;
+ 
+     if (target->shared_visual_handle)

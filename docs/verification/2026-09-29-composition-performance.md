@@ -63,3 +63,52 @@ for host repaint compatibility. Existing repeated-alpha accumulation semantics
 are preserved. Snapshot textures are immutable, so retained readers remain safe;
 there is still one allocation per acquired new presentation. No claim of a native
 GPU-only DirectComposition backend or full DirectComposition feature support.
+
+
+## Final GPU and geometry candidate
+
+The final native Wayland FL Studio test used the automatic Nexus GPU path, the
+hidden-producer pacing fix, blocking vblank waits, and both geometry indexes.
+Temporary D2D phase timing was removed before this test. The user reported
+“fixed, looks good.” This is a live subjective result, not a measured end-to-end
+input-latency number or a comparison across all plugins.
+
+Measured causes and separate checks:
+
+- Before the hidden-producer correction, 30 presentations with requested v-sync
+  took 1,403 ms (ordinary chain) or 8,617 ms (waitable chain), versus 9/4 ms with
+  immediate presentation. Afterward both hidden variants took approximately
+  3 ms. A normal visible HWND still took 469 ms for 30 requested-vsync frames.
+- CPU sampling identified 21% of sampled process CPU in DXVK's busy-wait loop.
+  120 output vblank waits took 2,000 ms wall / 800 ms CPU before the blocking
+  wait, versus 2,000 ms / 70 ms afterward. The user reported no subjective graph
+  improvement from this change alone.
+- Dense hollow polylines (ten 4,000-vertex paths) took 164 ms before the segment
+  index and approximately 7 ms afterward. Filled versions took 195 ms after the
+  segment index, then 50 ms with the fill-edge index. These are synthetic CPU
+  geometry timings on this host, not plugin frame times.
+- 206 deterministic path cases with lines, quadratic curves, multiple figures,
+  winding/alternate fill, self-intersections, repeated points, multiway crossings,
+  and nearly tangent curves at tiny/unit/large coordinate scales produced byte-identical
+  tessellation output against the previous implementation.
+- Clean final D2D/Dcomp binaries pass the 76 composition assertions and 22
+  layer/sprite checks. No diagnostic D2D timing instrumentation is shipped.
+- The automatic GPU policy test uses a JUCE window owned by a test PE named
+  `Nexus.vst3`, with no `WINE_DCOMP_GPU` override. It completed 3,000 frames,
+  360,000 geometry draws, 177 resizes and repeated content replacement. Tracing
+  confirmed 205 target creations and 1,787 GPU presentations.
+- Wine and DXVK patch-upgrade tests pass repeated application, existing-index
+  preservation and conflict preflight. The reconstructed DXVK source matches
+  the tested source exactly.
+- Final allocation stress completed 3,000 frames with 5,431,872 concurrent
+  allocations. The full-build rerun passes all 76 composition assertions,
+  concurrent Unmap checks, and rejection of unprotected contexts.
+- Generic premultiplied-alpha windows stayed on GDI even with the explicit GPU
+  test override. The automatic Nexus policy trace contains no CPU readbacks.
+
+The earlier cache-only CPU benchmark above does not describe this final stack.
+The real Nexus test covers this user's AMD/Wayland setup; it does not establish
+32-bit runtime behavior, all GPUs, complete DirectComposition conformance, or
+realtime audio/xrun performance. The full Wine build completed successfully for both enabled architectures;
+DXVK also built successfully. The independent legacy Wine 11.16 fixture remains unavailable in these
+shallow source checkouts; the 11.18 follow-up stack is the tested target.

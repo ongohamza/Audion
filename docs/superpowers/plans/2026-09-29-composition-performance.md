@@ -19,3 +19,22 @@ other transparent or complex targets retain GDI. Test content replacement,
 resize, lifecycle and native Wayland input. Verify live trace actually selects
 the path before asking the user to compare. Do not publish a lag-fix claim from
 synthetic throughput alone.
+
+
+## Measured follow-on work
+
+The hidden producer's v-sync delayed frame publication. Disable its sync interval
+while preserving the visible target's normal presentation semantics. A dedicated
+pacing probe checks both hidden waitable/nonwaitable chains and visible HWNDs.
+
+CPU samples subsequently identified DXVK busy waiting and Direct2D path
+self-intersection as separate costs. Replace busy waiting in WaitForVBlank only
+when the dummy composition compatibility option is enabled. Preserve the deadline
+and leave the normal DXVK policy unchanged; this lowers CPU consumption but the
+user reports graph smoothness unchanged.
+
+For Direct2D geometry, sort conservative segment bounds and test only possible
+intersections. Preserve the exact intersection routines and original pair
+orientation. Keep the existing algorithm for small paths, allocation failure,
+and nonfinite coordinates. Differential tessellation and dense-polyline timing
+coverage precede live Nexus verification. Do not ship temporary D2D timing code.
