@@ -82,6 +82,18 @@ int main(void)
  { POINT point={right+80,bottom+60}; HWND hit=WindowFromPoint(point);
    printf("ordinary desktop hit-test remains bounded: %s\n",!hit?"PASS":"FAIL"); if(hit) failures++;
  }
+ /* Automatic fullscreen clipping must not overwrite a Wayland surface mapping. */
+ {
+   HWND fullscreen=CreateWindowW(wc.lpszClassName,L"Automatic fullscreen clipping test",WS_POPUP|WS_VISIBLE,
+       0,0,right,bottom,0,0,wc.hInstance,0);
+   SetForegroundWindow(fullscreen); pump(); Sleep(1100); ClipCursor(NULL); pump();
+   check(fullscreen,"automatic fullscreen clip preserves Wayland coordinates",RAWINPUT|NO_VSCREEN_CLIP,
+       right+80,bottom+60,right+80,bottom+60);
+   /* Use a different point: the server drops unchanged motion before clipping. */
+   check(fullscreen,"automatic fullscreen clip still bounds ordinary hardware",RAWINPUT,
+       right+81,bottom+61,right-1,bottom-1);
+   DestroyWindow(fullscreen); SetForegroundWindow(hwnd); pump();
+ }
  ClipCursor(&clip); SetCursorPos(saved.x,saved.y); DestroyWindow(hwnd);
  printf("RESULT: %d failures\n",failures); return failures?1:0;
 }

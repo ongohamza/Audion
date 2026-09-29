@@ -6,7 +6,9 @@ The Wine 11.18 build includes these patches by default:
 2. `patches/wayland/0002-enable-flstudio-compatibility-by-default.patch`: enable compatibility automatically for `FL64.exe` and `FL.exe`. No launch environment variable is required. `WINE_WAYLAND_FLSTUDIO=0` is an optional diagnostic escape hatch.
 3. `patches/wayland/0003-match-window-hit-tests-to-wayland-input.patch`: allow the standard window hit-test traversal beyond the desktop rectangle when the active driver input uses the compatibility mapping.
 
-Use the [Wine + Audion + PipeASIO build instructions](BUILD_WINE_11.18.md). The manifest includes all three patches for both fresh and updated builds. Source patching and compilation alone do not update installed Wine. The installer refuses to replace a running Wine session.
+4. `patches/wayland/0004-release-desktop-pointer-confinement.patch`: release desktop-wide native pointer confinement for visible FL plugin cursors, while retaining hidden-cursor knob input and narrower clips. Automatic fullscreen clipping also preserves the driver's logical coordinates.
+
+Use the [Wine + Audion + PipeASIO build instructions](BUILD_WINE_11.18.md). The manifest includes all four patches for both fresh and updated builds. Source patching and compilation alone do not update installed Wine. The installer refuses to replace a running Wine session.
 
 ## Why Nexus needed the third patch
 
@@ -29,3 +31,18 @@ No audio callback, PipeASIO code, background polling loop, scheduler policy, or 
 ## Source provenance
 
 The original coordinate workaround adapts Alexandros Frantzis's draft [Wine MR7937](https://list.winehq.org/hyperkitty/list/wine-gitlab@list.winehq.org/thread/VSHC65GFGVYSB23BCIPE62NZESKEKYKT/), with the flag adjusted for Wine 11.18, default FL activation, explicit clipping and reapplication handling, and custom move integration. These are Audion compatibility patches, not upstream Wine acceptance claims.
+
+## Pointer confinement fix
+
+A native Wayland trace showed a full-desktop clip `(0,0)-(1920,1080)` being
+applied to a smaller plugin surface. Wayland intersected the clip with that
+surface, trapping the pointer inside the plugin. The fourth patch is automatic
+under the existing FL compatibility detection; no new environment setting or
+per-plugin name list is required.
+
+The visible cursor can now leave desktop-wide native constraints. Hidden
+cursor locking for relative knob gestures and narrower native clips remain.
+On the server, only automatic clips covering the full virtual desktop are
+bypassed for compatibility coordinates. Explicit Win32 clips and narrower
+automatic monitor clips retain their coordinate limits. See the
+[pointer verification record](verification/2026-09-29-pointer-confinement.md).

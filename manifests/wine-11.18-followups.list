@@ -7,3 +7,4 @@ patches/wayland/0003-match-window-hit-tests-to-wayland-input.patch
 patches/nexus-rendering/0003-reuse-composition-presentation-resources.patch
 patches/nexus-rendering/0004-present-opaque-nexus-frames-on-gpu.patch
 patches/nexus-rendering/0005-index-path-intersections-and-fill-tests.patch
+patches/wayland/0004-release-desktop-pointer-confinement.patch

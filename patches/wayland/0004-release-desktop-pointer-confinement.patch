@@ -1,0 +1,91 @@
+From: Audion contributors
+Subject: [PATCH] wayland: avoid trapping visible FL plugin pointers in desktop clips
+
+FL's automatic fullscreen clip covers the virtual desktop, but applying it to
+an individual plugin Wayland surface confines the pointer to that surface.
+Release desktop-covering native constraints for visible FL-compatible cursors;
+retain hidden-cursor relative input and narrower application constraints.
+
+Preserve logical surface coordinates through automatic full-desktop server
+clips, while retaining explicit clips, narrower automatic clips, and ordinary
+hardware clipping. This extends the existing compatibility input flag.
+
+diff --git a/dlls/winewayland.drv/wayland_pointer.c b/dlls/winewayland.drv/wayland_pointer.c
+index ff85c2e..542690b 100644
+--- a/dlls/winewayland.drv/wayland_pointer.c
++++ b/dlls/winewayland.drv/wayland_pointer.c
+@@ -1034,11 +1034,22 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
+     struct wl_surface *wl_surface = NULL;
+     struct wayland_surface *surface = NULL;
+     struct wayland_win_data *data;
+-    RECT confine_rect;
++    RECT confine_rect, desktop_rect;
++    BOOL desktop_clip = FALSE;
+     POINT cursor_pos, warp;
+ 
+     TRACE("clip=%s reset=%d\n", wine_dbgstr_rect(clip), reset);
+ 
++    if (flstudio_compat && clip)
++    {
++        /* Driver clip rectangles use raw screen coordinates, independent of
++         * the foreground window's DPI. */
++        desktop_rect = NtUserGetVirtualScreenRect(MDT_RAW_DPI);
++        desktop_clip = !IsRectEmpty(&desktop_rect) &&
++                       clip->left <= desktop_rect.left && clip->top <= desktop_rect.top &&
++                       clip->right >= desktop_rect.right && clip->bottom >= desktop_rect.bottom;
++    }
++
+     NtUserGetCursorPos(&cursor_pos);
+     hwnd = NtUserGetForegroundWindow();
+ 
+@@ -1054,6 +1065,12 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
+     wayland_win_data_release(data);
+ 
+     pthread_mutex_lock(&pointer->mutex);
++    /* A desktop-wide clip must not become a surface-sized trap when an FL
++     * plugin takes focus. Keep hidden-cursor locking for relative knob input,
++     * and preserve narrower application-requested clips. */
++    if (desktop_clip && (pointer->cursor.wl_surface || pointer->wp_cursor_shape_device_v1))
++        clip = NULL;
++
+     if (wl_surface && pointer->pending_warp)
+     {
+         if (process_wayland.wp_pointer_warp_v1)
+diff --git a/server/queue.c b/server/queue.c
+index 7d512cf..db9a491 100644
+--- a/server/queue.c
++++ b/server/queue.c
+@@ -474,6 +474,15 @@ static int is_cursor_clipped( struct desktop *desktop )
+     return !is_rect_equal( &clip_rect, &top_rect );
+ }
+ 
++/* Preserve Wayland's logical surface coordinates through automatic full-desktop
++ * clipping. Explicit application clips and narrower fullscreen clips still apply. */
++static int should_clip_cursor_pos( struct desktop *desktop )
++{
++    if (!(desktop->cursor_flags & SEND_HWMSG_NO_VSCREEN_CLIP)) return 1;
++    if (!(desktop->clip_flags & SET_CURSOR_CLIP)) return 0;
++    return !(desktop->clip_flags & SET_CURSOR_FSCLIP) || is_cursor_clipped( desktop );
++}
++
+ static void queue_cursor_message( struct desktop *desktop, user_handle_t win, unsigned int message,
+                                   lparam_t wparam, lparam_t lparam )
+ {
+@@ -533,7 +542,7 @@ static int update_desktop_cursor_pos( struct desktop *desktop, user_handle_t win
+ 
+     /* Wayland exposes surface-local coordinates, not the compositor's desktop
+      * placement. Keep the driver mapping intact, but honor application clips. */
+-    if (!(desktop->cursor_flags & SEND_HWMSG_NO_VSCREEN_CLIP) || (desktop->clip_flags & SET_CURSOR_CLIP))
++    if (should_clip_cursor_pos( desktop ))
+     {
+         x = max( min( x, desktop_shm->cursor.clip.right - 1 ), desktop_shm->cursor.clip.left );
+         y = max( min( y, desktop_shm->cursor.clip.bottom - 1 ), desktop_shm->cursor.clip.top );
+@@ -637,7 +646,7 @@ void set_clip_rectangle( struct desktop *desktop, const struct rectangle *rect,
+     desktop->clip_flags = flags;
+ 
+     /* A default clip reset must not undo the driver's surface mapping. */
+-    if (!(desktop->cursor_flags & SEND_HWMSG_NO_VSCREEN_CLIP) || (desktop->clip_flags & SET_CURSOR_CLIP))
++    if (should_clip_cursor_pos( desktop ))
+     {
+         x = max( min( desktop_shm->cursor.x, new_rect.right - 1 ), new_rect.left );
+         y = max( min( desktop_shm->cursor.y, new_rect.bottom - 1 ), new_rect.top );
