@@ -1,0 +1,774 @@
+From: Audion contributors
+Subject: [PATCH] wayland: restore iconic windows and import incoming file drops
+
+Track received activation separately from acknowledged geometry, retaining
+restore requests across coalesced configure events. FL Studio uses an iconic
+160x31 minimized rectangle instead of the sentinel assumed by the old code.
+
+Implement incoming local text/uri-list copy offers using Wine's existing OLE
+and WM_DROPFILES bridge. Bound transfer IO on a dedicated waiting thread and
+deliver imported CF_HDROP data on the destination GUI thread. Preserve clipboard
+backend selection and serialize app dispatch across protocol timeouts.
+
+diff --git a/dlls/winewayland.drv/dllmain.c b/dlls/winewayland.drv/dllmain.c
+index 8055d88..8c3db3c 100644
+--- a/dlls/winewayland.drv/dllmain.c
++++ b/dlls/winewayland.drv/dllmain.c
+@@ -38,6 +38,12 @@ static DWORD WINAPI wayland_read_events_thread(void *arg)
+     return 0;
+ }
+ 
++static DWORD WINAPI wayland_read_drop_files_thread(void *arg)
++{
++    WAYLANDDRV_UNIX_CALL(read_drop_files, NULL);
++    return 0;
++}
++
+ static LRESULT CALLBACK clipboard_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+ {
+     switch (msg)
+@@ -107,6 +113,8 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
+ 
+     /* Read wayland events from a dedicated thread. */
+     CloseHandle(CreateThread(NULL, 0, wayland_read_events_thread, NULL, 0, &tid));
++    /* File transfers must never block the Wayland event dispatch thread. */
++    CloseHandle(CreateThread(NULL, 0, wayland_read_drop_files_thread, NULL, 0, &tid));
+     /* Handle clipboard events in a dedicated thread, if needed. */
+     if (!WAYLANDDRV_UNIX_CALL(init_clipboard, NULL))
+         CloseHandle(CreateThread(NULL, 0, clipboard_thread, NULL, 0, &tid));
+diff --git a/dlls/winewayland.drv/unixlib.h b/dlls/winewayland.drv/unixlib.h
+index d9378fe..4cdb734 100644
+--- a/dlls/winewayland.drv/unixlib.h
++++ b/dlls/winewayland.drv/unixlib.h
+@@ -28,6 +28,7 @@ enum waylanddrv_unix_func
+     waylanddrv_unix_func_init,
+     waylanddrv_unix_func_read_events,
+     waylanddrv_unix_func_init_clipboard,
++    waylanddrv_unix_func_read_drop_files,
+     waylanddrv_unix_func_count,
+ };
+ 
+diff --git a/dlls/winewayland.drv/wayland.c b/dlls/winewayland.drv/wayland.c
+index 52ba39c..863541b 100644
+--- a/dlls/winewayland.drv/wayland.c
++++ b/dlls/winewayland.drv/wayland.c
+@@ -187,7 +187,8 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
+     else if (strcmp(interface, "wl_data_device_manager") == 0)
+     {
+         process_wayland.wl_data_device_manager =
+-            wl_registry_bind(registry, id, &wl_data_device_manager_interface, 2);
++            wl_registry_bind(registry, id, &wl_data_device_manager_interface,
++                             version < 3 ? version : 3);
+     }
+     else if (strcmp(interface, "xdg_toplevel_icon_manager_v1") == 0)
+     {
+@@ -373,6 +374,11 @@ BOOL wayland_process_init(void)
+     if (!process_wayland.wp_fractional_scale_manager_v1)
+         ERR("Wayland compositor doesn't support wp_fractional_scale_manager_v1 (fractional scaling will be broken)\n");
+ 
++    /* Every application needs a core data device for incoming drag-and-drop,
++     * even when the desktop process owns the wlr clipboard. */
++    if (process_wayland.seat.wl_seat && process_wayland.zwlr_data_control_manager_v1)
++        wayland_data_device_init();
++
+     process_wayland.initialized = TRUE;
+ 
+     return TRUE;
+diff --git a/dlls/winewayland.drv/wayland_data_device.c b/dlls/winewayland.drv/wayland_data_device.c
+index 4683025..1170cab 100644
+--- a/dlls/winewayland.drv/wayland_data_device.c
++++ b/dlls/winewayland.drv/wayland_data_device.c
+@@ -26,11 +26,15 @@
+ 
+ #include <errno.h>
+ #include <fcntl.h>
++#include <poll.h>
++#include <time.h>
+ #include <stdlib.h>
+ #include <unistd.h>
+ 
+ #include "waylanddrv.h"
++#include "oleidl.h"
+ #include "wine/debug.h"
++#include "wine/unixlib.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(clipboard);
+ 
+@@ -55,6 +59,8 @@ struct wayland_data_offer
+         struct wl_data_offer *wl_data_offer;
+     };
+     struct wl_array types;
++    BOOL is_data_control;
++    uint32_t dnd_action;
+ };
+ 
+ static HWND clipboard_hwnd;
+@@ -374,12 +380,24 @@ static void data_offer_offer(void *data, struct wl_data_offer *wl_data_offer, co
+     data_control_offer_offer(data, NULL, type);
+ }
+ 
++static void data_offer_source_actions(void *data, struct wl_data_offer *offer, uint32_t actions)
++{
++}
++
++static void data_offer_action(void *data, struct wl_data_offer *offer, uint32_t action)
++{
++    struct wayland_data_offer *data_offer = data;
++    data_offer->dnd_action = action;
++}
++
+ static const struct wl_data_offer_listener data_offer_listener =
+ {
+     data_offer_offer,
++    data_offer_source_actions,
++    data_offer_action,
+ };
+ 
+-static void wayland_data_offer_create(void *offer_proxy)
++static void wayland_data_offer_create(void *offer_proxy, BOOL is_data_control)
+ {
+     struct wayland_data_offer *data_offer;
+ 
+@@ -390,7 +408,9 @@ static void wayland_data_offer_create(void *offer_proxy)
+     }
+ 
+     wl_array_init(&data_offer->types);
+-    if (process_wayland.zwlr_data_control_manager_v1)
++    data_offer->is_data_control = is_data_control;
++    data_offer->dnd_action = WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY;
++    if (is_data_control)
+     {
+         data_offer->zwlr_data_control_offer_v1 = offer_proxy;
+         zwlr_data_control_offer_v1_add_listener(data_offer->zwlr_data_control_offer_v1,
+@@ -399,6 +419,8 @@ static void wayland_data_offer_create(void *offer_proxy)
+     else
+     {
+         data_offer->wl_data_offer = offer_proxy;
++        if (wl_data_offer_get_version(data_offer->wl_data_offer) >= 3)
++            data_offer->dnd_action = WL_DATA_DEVICE_MANAGER_DND_ACTION_NONE;
+         wl_data_offer_add_listener(data_offer->wl_data_offer, &data_offer_listener,
+                                    data_offer);
+ 
+@@ -409,7 +431,8 @@ static void wayland_data_offer_destroy(struct wayland_data_offer *data_offer)
+ {
+     char **p;
+ 
+-    if (process_wayland.zwlr_data_control_manager_v1)
++    if (!data_offer) return;
++    if (data_offer->is_data_control)
+         zwlr_data_control_offer_v1_destroy(data_offer->zwlr_data_control_offer_v1);
+     else
+         wl_data_offer_destroy(data_offer->wl_data_offer);
+@@ -437,7 +460,7 @@ static int wayland_data_offer_get_import_fd(struct wayland_data_offer *data_offe
+         fcntl(data_pipe[1], F_SETFD, FD_CLOEXEC);
+     }
+ 
+-    if (process_wayland.zwlr_data_control_manager_v1)
++    if (data_offer->is_data_control)
+     {
+         zwlr_data_control_offer_v1_receive(data_offer->zwlr_data_control_offer_v1,
+                                            mime_type, data_pipe[1]);
+@@ -495,7 +518,7 @@ static void data_control_device_data_offer(
+     struct zwlr_data_control_device_v1 *zwlr_data_control_device_v1,
+     struct zwlr_data_control_offer_v1 *zwlr_data_control_offer_v1)
+ {
+-    wayland_data_offer_create(zwlr_data_control_offer_v1);
++    wayland_data_offer_create(zwlr_data_control_offer_v1, TRUE);
+ }
+ 
+ static void handle_selection(struct wayland_data_device *data_device,
+@@ -654,10 +677,284 @@ static const struct wl_data_source_listener data_source_listener =
+  *          wl_data_device handling
+  */
+ 
++/* Only local file URIs are imported. In particular, a file manager's remote
++ * URLs must never cause a network fetch or be interpreted as local paths. */
++static int uri_hex(char c)
++{
++    if (c >= '0' && c <= '9') return c - '0';
++    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
++    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
++    return -1;
++}
++
++static char *local_uri_path(const char *uri, size_t size)
++{
++    const char *path, *end = uri + size;
++    char hostname[256], *out, *p;
++    int hi, lo;
++
++    if (size < 6 || memcmp(uri, "file:/", 6) || memchr(uri, 0, size)) return NULL;
++    path = uri + 5;
++    if (size >= 7 && uri[6] == '/')
++    {
++        const char *host = uri + 7;
++        if (!(path = memchr(host, '/', end - host))) return NULL;
++        if (path != host && !(path - host == 9 && !memcmp(host, "localhost", 9)))
++        {
++            if (gethostname(hostname, sizeof(hostname))) return NULL;
++            hostname[sizeof(hostname) - 1] = 0;
++            if (strlen(hostname) != (size_t)(path - host) || memcmp(host, hostname, path - host)) return NULL;
++        }
++    }
++    if (!(out = malloc(end - path + 1))) return NULL;
++    for (p = out; path < end; ++path)
++    {
++        if (*path == '?' || *path == '#') goto invalid;
++        if (*path == '%')
++        {
++            if (end - path < 3 || (hi = uri_hex(path[1])) < 0 ||
++                (lo = uri_hex(path[2])) < 0 || !(hi || lo)) goto invalid;
++            *p++ = (hi << 4) | lo;
++            path += 2;
++        }
++        else *p++ = *path;
++    }
++    *p = 0;
++    return out;
++invalid:
++    free(out);
++    return NULL;
++}
++
++static void *import_uri_list(void *data, size_t size, size_t *ret_size)
++{
++    const char *line = data, *end = line + size, *next;
++    struct drop_files *drop = NULL, *new_drop;
++    size_t used = sizeof(*drop), len;
++    WCHAR *dos;
++    char *path;
++
++    while (line < end)
++    {
++        next = memchr(line, '\n', end - line);
++        if (!next) next = end;
++        len = next - line;
++        if (len && line[len - 1] == '\r') --len;
++        if (len && *line != '#' && (path = local_uri_path(line, len)))
++        {
++            dos = NULL;
++            ntdll_get_dos_file_name(path, &dos, FILE_OPEN);
++            free(path);
++            if (dos)
++            {
++                len = (lstrlenW(dos) + 1) * sizeof(WCHAR);
++                new_drop = realloc(drop, used + len + sizeof(WCHAR));
++                if (!new_drop) { free(dos); free(drop); return NULL; }
++                drop = new_drop;
++                memcpy((char *)drop + used, dos, len);
++                used += len;
++                free(dos);
++            }
++        }
++        line = next == end ? end : next + 1;
++    }
++    if (!drop) return NULL;
++    memset(drop, 0, sizeof(*drop));
++    drop->pFiles = sizeof(*drop);
++    drop->fWide = TRUE;
++    *(WCHAR *)((char *)drop + used) = 0;
++    *ret_size = used + sizeof(WCHAR);
++    return drop;
++}
++
++#define DROP_MAX_BYTES (1024 * 1024)
++#define DROP_READ_TIMEOUT 3000
++
++/* The event thread owns drag_offer until drop. Afterwards the transfer thread
++ * owns it. No application or COM code ever runs on either of those threads. */
++static struct wayland_data_offer *drag_offer;
++static HWND drag_hwnd;
++static POINT drag_point;
++static uint32_t drag_serial;
++static pthread_mutex_t drop_mutex = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t drop_cond = PTHREAD_COND_INITIALIZER;
++static struct
++{
++    struct wayland_data_offer *offer;
++    int fd;
++    HWND hwnd;
++    POINT point;
++    ULONG_PTR generation;
++    void *data;
++    size_t size;
++    BOOL ready, handled;
++    DWORD effect;
++} pending_drop;
++static ULONG_PTR drop_generation;
++/* user32 owns a single process-wide drag object. A timed-out protocol offer
++ * must not allow another drop while application code is still handling it. */
++static BOOL drop_gui_busy;
++
++static void *read_drop_data(int fd, size_t *size)
++{
++    struct timespec now, start;
++    struct pollfd pollfd = {.fd = fd, .events = POLLIN};
++    char *data;
++    ssize_t count;
++    int remaining, ret;
++    size_t used = 0;
++
++    if (!(data = malloc(DROP_MAX_BYTES))) return NULL;
++    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
++    clock_gettime(CLOCK_MONOTONIC, &start);
++    for (;;)
++    {
++        clock_gettime(CLOCK_MONOTONIC, &now);
++        remaining = DROP_READ_TIMEOUT - (now.tv_sec - start.tv_sec) * 1000 -
++                    (now.tv_nsec - start.tv_nsec) / 1000000;
++        if (remaining <= 0) break;
++        ret = poll(&pollfd, 1, remaining);
++        if (ret < 0 && errno == EINTR) continue;
++        if (ret <= 0) break;
++        count = read(fd, data + used, DROP_MAX_BYTES - used);
++        if (!count) { *size = used; return data; }
++        if (count < 0)
++        {
++            if (errno == EINTR || errno == EAGAIN) continue;
++            break;
++        }
++        used += count;
++        if (used == DROP_MAX_BYTES) break;
++    }
++    WARN("file drop transfer failed, timed out, or exceeded size limit\n");
++    free(data);
++    return NULL;
++}
++
++NTSTATUS wayland_read_drop_files(void *arg)
++{
++    struct wayland_data_offer *offer;
++    struct timespec deadline;
++    void *data, *drop;
++    size_t size, drop_size;
++    DWORD effect;
++
++    pthread_mutex_lock(&drop_mutex);
++    for (;;)
++    {
++        while (!pending_drop.offer) pthread_cond_wait(&drop_cond, &drop_mutex);
++        offer = pending_drop.offer;
++        pthread_mutex_unlock(&drop_mutex);
++        drop = NULL;
++        if ((data = read_drop_data(pending_drop.fd, &size)))
++        {
++            drop = import_uri_list(data, size, &drop_size);
++            free(data);
++        }
++        close(pending_drop.fd);
++        pthread_mutex_lock(&drop_mutex);
++        pending_drop.data = drop;
++        pending_drop.size = drop ? drop_size : 0;
++        pending_drop.ready = !!drop;
++        if (drop && NtUserPostMessage(pending_drop.hwnd, WM_WAYLAND_DROP_FILES,
++                                      pending_drop.generation, 0))
++        {
++            /* A destroyed or unresponsive window must not retain offers forever.
++             * The receiver copies the payload before calling into the app. */
++            clock_gettime(CLOCK_REALTIME, &deadline);
++            deadline.tv_sec += 5;
++            while (!pending_drop.handled)
++                if (pthread_cond_timedwait(&drop_cond, &drop_mutex, &deadline) == ETIMEDOUT) break;
++        }
++        effect = pending_drop.handled ? pending_drop.effect : DROPEFFECT_NONE;
++        free(pending_drop.data);
++        memset(&pending_drop, 0, sizeof(pending_drop));
++        pthread_mutex_unlock(&drop_mutex);
++        if (effect == DROPEFFECT_COPY && wl_data_offer_get_version(offer->wl_data_offer) >= 3)
++            wl_data_offer_finish(offer->wl_data_offer);
++        wayland_data_offer_destroy(offer);
++        wl_display_flush(process_wayland.wl_display);
++        pthread_mutex_lock(&drop_mutex);
++    }
++    return 0;
++}
++
++LRESULT wayland_drop_files(HWND hwnd, ULONG_PTR generation)
++{
++    struct format_entry *entry = NULL;
++    POINT point;
++    DWORD effect = DROPEFFECT_NONE;
++    size_t size = 0;
++    BOOL claimed = FALSE;
++
++    pthread_mutex_lock(&drop_mutex);
++    if (pending_drop.ready && !pending_drop.handled && pending_drop.hwnd == hwnd &&
++        pending_drop.generation == generation)
++    {
++        claimed = TRUE;
++        size = offsetof(struct format_entry, data) + pending_drop.size;
++        if ((entry = malloc(size)))
++        {
++            entry->format = CF_HDROP;
++            entry->size = pending_drop.size;
++            memcpy(entry->data, pending_drop.data, pending_drop.size);
++            point = pending_drop.point;
++            drop_gui_busy = TRUE;
++        }
++        pending_drop.ready = FALSE;
++    }
++    pthread_mutex_unlock(&drop_mutex);
++    if (entry)
++    {
++        if (NtUserMessageCall(0, WINE_DRAG_DROP_ENTER, size, (LPARAM)entry, NULL,
++                              NtUserDragDropCall, FALSE)) goto done;
++        NtUserMessageCall(hwnd, WINE_DRAG_DROP_DRAG, MAKELONG(point.x, point.y), DROPEFFECT_COPY,
++                          NULL, NtUserDragDropCall, FALSE);
++        /* The first call enters the target; the second runs DragOver and saves
++         * its negotiated effect in user32, even when no pointer motion occurred. */
++        effect = NtUserMessageCall(hwnd, WINE_DRAG_DROP_DRAG, MAKELONG(point.x, point.y), DROPEFFECT_COPY,
++                                   NULL, NtUserDragDropCall, FALSE);
++        if (effect == DROPEFFECT_COPY)
++            effect = NtUserMessageCall(hwnd, WINE_DRAG_DROP_DROP, 0, 0, NULL, NtUserDragDropCall, FALSE);
++        else
++            NtUserMessageCall(0, WINE_DRAG_DROP_LEAVE, 0, 0, NULL, NtUserDragDropCall, FALSE);
++    }
++done:
++    free(entry);
++    pthread_mutex_lock(&drop_mutex);
++    if (entry) drop_gui_busy = FALSE;
++    if (claimed && pending_drop.generation == generation && pending_drop.hwnd == hwnd)
++    {
++        pending_drop.effect = effect;
++        pending_drop.handled = TRUE;
++        pthread_cond_signal(&drop_cond);
++    }
++    pthread_mutex_unlock(&drop_mutex);
++    return 0;
++}
++
++static BOOL drag_update_point(wl_fixed_t x, wl_fixed_t y)
++{
++    struct wayland_win_data *win_data;
++    struct wayland_surface *surface;
++    POINT point = {wl_fixed_to_double(x), wl_fixed_to_double(y)};
++
++    if (!(win_data = wayland_win_data_get(drag_hwnd))) return FALSE;
++    if ((surface = win_data->wayland_surface))
++    {
++        point = map_point_from_surface(surface, point);
++        point.x += surface->window.rect.left;
++        point.y += surface->window.rect.top;
++        drag_point = point;
++    }
++    wayland_win_data_release(win_data);
++    return !!surface;
++}
++
+ static void data_device_data_offer(void *data, struct wl_data_device *wl_data_device,
+                                    struct wl_data_offer *wl_data_offer)
+ {
+-    wayland_data_offer_create(wl_data_offer);
++    wayland_data_offer_create(wl_data_offer, FALSE);
+ }
+ 
+ static void data_device_enter(void *data, struct wl_data_device *wl_data_device,
+@@ -665,24 +962,80 @@ static void data_device_enter(void *data, struct wl_data_device *wl_data_device,
+                               wl_fixed_t x_w, wl_fixed_t y_w,
+                               struct wl_data_offer *wl_data_offer)
+ {
++    BOOL busy;
++
++    if (drag_offer) wayland_data_offer_destroy(drag_offer);
++    drag_offer = wl_data_offer ? wl_data_offer_get_user_data(wl_data_offer) : NULL;
++    drag_hwnd = wl_surface ? wl_surface_get_user_data(wl_surface) : 0;
++    drag_serial = serial;
++    pthread_mutex_lock(&drop_mutex);
++    busy = !!pending_drop.offer || drop_gui_busy;
++    pthread_mutex_unlock(&drop_mutex);
++    if (drag_offer && !busy && drag_hwnd && drag_update_point(x_w, y_w) &&
++        string_array_contains(&drag_offer->types, "text/uri-list"))
++    {
++        if (wl_data_offer_get_version(wl_data_offer) >= 3)
++            wl_data_offer_set_actions(wl_data_offer, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY,
++                                      WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
++        wl_data_offer_accept(wl_data_offer, serial, "text/uri-list");
++    }
++    else
++    {
++        drag_hwnd = 0;
++        if (wl_data_offer) wl_data_offer_accept(wl_data_offer, serial, NULL);
++    }
++    wl_display_flush(process_wayland.wl_display);
+ }
+ 
+ static void data_device_leave(void *data, struct wl_data_device *wl_data_device)
+ {
++    if (drag_offer) wayland_data_offer_destroy(drag_offer);
++    drag_offer = NULL;
++    drag_hwnd = 0;
+ }
+ 
+ static void data_device_motion(void *data, struct wl_data_device *wl_data_device,
+                                uint32_t time, wl_fixed_t x_w, wl_fixed_t y_w)
+ {
++    if (drag_hwnd && !drag_update_point(x_w, y_w))
++    {
++        drag_hwnd = 0;
++        if (drag_offer) wl_data_offer_accept(drag_offer->wl_data_offer, drag_serial, NULL);
++    }
+ }
+ 
+ static void data_device_drop(void *data, struct wl_data_device *wl_data_device)
+ {
++    int fd;
++
++    pthread_mutex_lock(&drop_mutex);
++    if (drag_offer && drag_hwnd && !pending_drop.offer && !drop_gui_busy &&
++        drag_offer->dnd_action == WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY &&
++        (fd = wayland_data_offer_get_import_fd(drag_offer, "text/uri-list")) >= 0)
++    {
++        pending_drop.offer = drag_offer;
++        pending_drop.fd = fd;
++        pending_drop.hwnd = drag_hwnd;
++        pending_drop.point = drag_point;
++        pending_drop.generation = ++drop_generation;
++        drag_offer = NULL;
++        pthread_cond_signal(&drop_cond);
++    }
++    pthread_mutex_unlock(&drop_mutex);
++    if (drag_offer) wayland_data_offer_destroy(drag_offer);
++    drag_offer = NULL;
++    drag_hwnd = 0;
+ }
+ 
+ static void data_device_selection(void *data, struct wl_data_device *wl_data_device,
+                                   struct wl_data_offer *wl_data_offer)
+ {
++    /* The core device also exists when wlr owns clipboard selection. */
++    if (process_wayland.zwlr_data_control_manager_v1)
++    {
++        if (wl_data_offer) wayland_data_offer_destroy(wl_data_offer_get_user_data(wl_data_offer));
++        return;
++    }
+     handle_selection(data, wl_data_offer ? wl_data_offer_get_user_data(wl_data_offer) : NULL);
+ }
+ 
+@@ -704,7 +1057,7 @@ void wayland_data_device_init(void)
+     TRACE("\n");
+ 
+     pthread_mutex_lock(&data_device->mutex);
+-    if (process_wayland.zwlr_data_control_manager_v1)
++    if (process_wayland.zwlr_data_control_manager_v1 && clipboard_hwnd)
+     {
+         if (data_device->zwlr_data_control_device_v1)
+             zwlr_data_control_device_v1_destroy(data_device->zwlr_data_control_device_v1);
+@@ -719,10 +1072,17 @@ void wayland_data_device_init(void)
+                 data_device);
+         }
+     }
+-    else if (process_wayland.wl_data_device_manager)
++    if (data_device->wl_data_device && data_device->seat_global_id != process_wayland.seat.global_id)
+     {
+-        if (data_device->wl_data_device)
++        if (wl_data_device_get_version(data_device->wl_data_device) >= 2)
+             wl_data_device_release(data_device->wl_data_device);
++        else
++            wl_data_device_destroy(data_device->wl_data_device);
++        data_device->wl_data_device = NULL;
++    }
++    data_device->seat_global_id = process_wayland.seat.global_id;
++    if (process_wayland.wl_data_device_manager && !data_device->wl_data_device)
++    {
+         data_device->wl_data_device =
+             wl_data_device_manager_get_data_device(
+                 process_wayland.wl_data_device_manager,
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index bcaa8c0..52a6c66 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -57,6 +57,14 @@ static void xdg_surface_handle_configure(void *private, struct xdg_surface *xdg_
+         should_post = surface->requested.serial == 0;
+         initial_configure = surface->current.serial == 0;
+         surface->pending.serial = serial;
++        /* Activation belongs to the received configure stream, not to the
++         * last geometry we could acknowledge. Preserve a restore request
++         * when multiple active configurations coalesce before dispatch. */
++        if (!surface->pending.activated)
++            surface->restore_pending = FALSE;
++        else if (!surface->received_activated && surface->window.minimized)
++            surface->restore_pending = TRUE;
++        surface->received_activated = surface->pending.activated;
+         surface->requested = surface->pending;
+         memset(&surface->pending, 0, sizeof(surface->pending));
+     }
+@@ -87,12 +95,16 @@ static void xdg_toplevel_handle_configure(void *private,
+     HWND hwnd = private;
+     uint32_t *state;
+     enum wayland_surface_config_state config_state = 0;
++    BOOL activated = FALSE;
+     struct wayland_win_data *data;
+ 
+     wl_array_for_each(state, states)
+     {
+         switch(*state)
+         {
++        case XDG_TOPLEVEL_STATE_ACTIVATED:
++            activated = TRUE;
++            break;
+         case XDG_TOPLEVEL_STATE_MAXIMIZED:
+             config_state |= WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED;
+             break;
+@@ -113,7 +125,7 @@ static void xdg_toplevel_handle_configure(void *private,
+         }
+     }
+ 
+-    TRACE("hwnd=%p %dx%d,%#x\n", hwnd, width, height, config_state);
++    TRACE("hwnd=%p %dx%d,%#x activated=%u\n", hwnd, width, height, config_state, activated);
+ 
+     if (!(data = wayland_win_data_get(hwnd))) return;
+ 
+@@ -121,6 +133,7 @@ static void xdg_toplevel_handle_configure(void *private,
+     {
+         SetRect(&surface->pending.rect, 0, 0, width, height);
+         surface->pending.state = config_state;
++        surface->pending.activated = activated;
+     }
+ 
+     wayland_win_data_release(data);
+@@ -472,6 +485,8 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
+     memset(&surface->requested, 0, sizeof(surface->requested));
+     memset(&surface->processing, 0, sizeof(surface->processing));
+     memset(&surface->current, 0, sizeof(surface->current));
++    surface->received_activated = FALSE;
++    surface->restore_pending = FALSE;
+ 
+     /* Ensure no buffer is attached, otherwise future role assignments may fail. */
+     wl_surface_attach(surface->wl_surface, NULL, 0, 0);
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index c166e8b..0f6bec2 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -73,6 +73,7 @@ enum wayland_window_message
+     WM_WAYLAND_INIT_DISPLAY_DEVICES = WM_WINE_FIRST_DRIVER_MSG,
+     WM_WAYLAND_CONFIGURE,
+     WM_WAYLAND_SET_FOREGROUND,
++    WM_WAYLAND_DROP_FILES,
+ };
+ 
+ enum wayland_surface_config_state
+@@ -150,21 +151,13 @@ struct wayland_seat
+ 
+ struct wayland_data_device
+ {
+-    union
+-    {
+-        struct
+-        {
+-            struct zwlr_data_control_device_v1 *zwlr_data_control_device_v1;
+-            struct zwlr_data_control_source_v1 *zwlr_data_control_source_v1;
+-            struct zwlr_data_control_offer_v1 *clipboard_zwlr_data_control_offer_v1;
+-        };
+-        struct
+-        {
+-            struct wl_data_device *wl_data_device;
+-            struct wl_data_source *wl_data_source;
+-            struct wl_data_offer *clipboard_wl_data_offer;
+-        };
+-    };
++    uint32_t seat_global_id;
++    struct zwlr_data_control_device_v1 *zwlr_data_control_device_v1;
++    struct zwlr_data_control_source_v1 *zwlr_data_control_source_v1;
++    struct zwlr_data_control_offer_v1 *clipboard_zwlr_data_control_offer_v1;
++    struct wl_data_device *wl_data_device;
++    struct wl_data_source *wl_data_source;
++    struct wl_data_offer *clipboard_wl_data_offer;
+     pthread_mutex_t mutex;
+ };
+ 
+@@ -239,6 +232,7 @@ struct wayland_surface_config
+     enum wayland_surface_config_state state;
+     uint32_t serial;
+     BOOL processed;
++    BOOL activated;
+ };
+ 
+ struct wayland_window_config
+@@ -306,6 +300,8 @@ struct wayland_surface
+     struct wp_alpha_modifier_surface_v1 *wp_alpha_modifier_surface_v1;
+ 
+     struct wayland_surface_config pending, requested, processing, current;
++    BOOL received_activated;
++    BOOL restore_pending;
+     BOOL resizing;
+     struct wayland_window_config window;
+     int content_width, content_height;
+@@ -432,6 +428,8 @@ void wayland_text_input_deinit(void);
+  */
+ 
+ void wayland_data_device_init(void);
++NTSTATUS wayland_read_drop_files(void *arg);
++LRESULT wayland_drop_files(HWND hwnd, ULONG_PTR generation);
+ 
+ /**********************************************************************
+  *          Helpers
+diff --git a/dlls/winewayland.drv/waylanddrv_main.c b/dlls/winewayland.drv/waylanddrv_main.c
+index bb66154..b60eb64 100644
+--- a/dlls/winewayland.drv/waylanddrv_main.c
++++ b/dlls/winewayland.drv/waylanddrv_main.c
+@@ -139,6 +139,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
+     waylanddrv_unix_init,
+     waylanddrv_unix_read_events,
+     waylanddrv_unix_init_clipboard,
++    wayland_read_drop_files,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == waylanddrv_unix_func_count);
+@@ -150,6 +151,7 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
+     waylanddrv_unix_init,
+     waylanddrv_unix_read_events,
+     waylanddrv_unix_init_clipboard,
++    wayland_read_drop_files,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == waylanddrv_unix_func_count);
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index 588047e..e33a8de 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -143,6 +143,10 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
+ 
+     TRACE("window=%s style=%#x\n", wine_dbgstr_rect(&conf->rect), style);
+ 
++    /* A compositor activation from an earlier minimize cycle must not
++     * restore a newly minimized window, or outlive an explicit restore. */
++    if (conf->minimized != !!(style & WS_MINIMIZE) && data->wayland_surface)
++        data->wayland_surface->restore_pending = FALSE;
+     conf->minimized = !!(style & WS_MINIMIZE);
+ 
+     /* The fullscreen state is implied by the window position and style. */
+@@ -599,19 +603,15 @@ static void wayland_configure_window(HWND hwnd)
+         flags |= SWP_NOSIZE;
+     }
+ 
+-    /* Detect a restore from an application-initiated minimize: the last
+-     * requested config placed the window at the offscreen sentinel position
+-     * with WS_MINIMIZE, and the compositor is now sending a configure. Ack
+-     * the configure to avoid a protocol violation and send SC_RESTORE so
+-     * Win32 runs the full restore sequence (clearing WS_MINIMIZE, restoring
+-     * position/size, sending WM_SIZE, etc.), which triggers a new configure
+-     * cycle. */
+-    restoring_from_minimize = surface->window.rect.left <= -32000 &&
+-                              surface->window.rect.top  <= -32000 &&
+-                              surface->window.minimized;
++    /* Borderless windows may minimize to iconic rectangles rather than the
++     * -32000 sentinel. Restore when the compositor reactivates the window,
++     * not for an arbitrary configure generated while minimizing it. */
++    restoring_from_minimize = surface->window.minimized &&
++                              surface->processing.activated && surface->restore_pending;
+     if (restoring_from_minimize)
+     {
+         TRACE("hwnd=%p restoring from minimize\n", hwnd);
++        surface->restore_pending = FALSE;
+         surface->current = surface->processing;
+         memset(&surface->processing, 0, sizeof(surface->processing));
+         xdg_surface_ack_configure(surface->xdg_surface,
+@@ -667,6 +667,8 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+     case WM_WAYLAND_CONFIGURE:
+         wayland_configure_window(hwnd);
+         return 0;
++    case WM_WAYLAND_DROP_FILES:
++        return wayland_drop_files(hwnd, wp);
+     case WM_WAYLAND_SET_FOREGROUND:
+         NtUserSetForegroundWindowInternal(hwnd);
+         return 0;

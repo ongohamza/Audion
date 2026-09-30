@@ -8,7 +8,9 @@ The Wine 11.18 build includes these patches by default:
 
 4. `patches/wayland/0004-release-desktop-pointer-confinement.patch`: release desktop-wide native pointer confinement for visible FL plugin cursors, while retaining hidden-cursor knob input and narrower clips. Automatic fullscreen clipping also preserves the driver's logical coordinates.
 
-Use the [Wine + Audion + PipeASIO build instructions](BUILD_WINE_11.18.md). The manifest includes all four patches for both fresh and updated builds. Source patching and compilation alone do not update installed Wine. The installer refuses to replace a running Wine session.
+5. `patches/wayland/0005-restore-minimized-windows-and-import-file-drops.patch`: restore minimized windows when the compositor reactivates them, including FL's iconic window geometry, and import local file drops from Dolphin/desktop through Windows drag-and-drop handling.
+
+Use the [Wine + Audion + PipeASIO build instructions](BUILD_WINE_11.18.md). The manifest includes all five patches for both fresh and updated builds. Source patching and compilation alone do not update installed Wine. The installer refuses to replace a running Wine session.
 
 ## Why Nexus needed the third patch
 
@@ -46,3 +48,23 @@ On the server, only automatic clips covering the full virtual desktop are
 bypassed for compatibility coordinates. Explicit Win32 clips and narrower
 automatic monitor clips retain their coordinate limits. See the
 [pointer verification record](verification/2026-09-29-pointer-confinement.md).
+
+## Restoration and external file drops
+
+The fifth patch restores FL Studio's normal window when clicking its taskbar
+entry after minimization. It tracks compositor activation independently of
+geometry acknowledgments, so delayed or coalesced configure events do not leave
+FL as a tiny menu strip. No new custom edge-resize translation is introduced.
+The live menu test worked during diagnosis; the demonstrated restoration bug
+is repaired and the user confirmed the combined candidate test.
+
+Dolphin and desktop drops now import local file paths through Wine's existing
+OLE/WM_DROPFILES bridge. Incoming copies into the Sampler and Playlist use
+that shared application path. File-transfer IO runs off the Wayland event and
+application threads; transfers are limited to 1 MiB of URI metadata and three
+seconds. This limit applies to the list of paths, not the audio file sizes.
+The worker waits when idle and does not poll or change thread priorities.
+
+This adds incoming local-file copies, not outgoing drags, remote downloads or
+OLE hover previews. Existing clipboard handling is preserved. See the
+[verification record](verification/2026-09-29-wayland-restore-file-drops.md).
