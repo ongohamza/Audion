@@ -1,0 +1,226 @@
+From 971f09a123057429f800e8698711625825a0ae2e Mon Sep 17 00:00:00 2001
+From: ongohamza <hkhamzash773@gmail.com>
+Date: Tue, 29 Sep 2026 22:46:04 -0700
+Subject: [PATCH] winewayland: Hand FL main window moves and border resizes to
+ the compositor
+
+---
+ dlls/winewayland.drv/wayland_pointer.c |   5 ++
+ dlls/winewayland.drv/waylanddrv.h      |   2 +
+ dlls/winewayland.drv/window.c          | 112 +++++++++++++++++++++----
+ 3 files changed, 104 insertions(+), 15 deletions(-)
+
+diff --git a/dlls/winewayland.drv/wayland_pointer.c b/dlls/winewayland.drv/wayland_pointer.c
+index 9f15b66..c22143d 100644
+--- a/dlls/winewayland.drv/wayland_pointer.c
++++ b/dlls/winewayland.drv/wayland_pointer.c
+@@ -321,6 +321,11 @@ static void pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
+     if (button == BTN_LEFT)
+     {
+         pointer->left_button_serial = state == WL_POINTER_BUTTON_STATE_PRESSED ? serial : 0;
++        if (state == WL_POINTER_BUTTON_STATE_PRESSED)
++        {
++            pointer->left_button_x = pointer->surface_x;
++            pointer->left_button_y = pointer->surface_y;
++        }
+     }
+     pthread_mutex_unlock(&pointer->mutex);
+ 
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index 661b3cb..973f3df 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -121,11 +121,13 @@ struct wayland_pointer
+     BOOL relative_mode;
+     BOOL pending_warp;
+     wl_fixed_t surface_x, surface_y;
++    wl_fixed_t left_button_x, left_button_y;
+     HWND refresh_hwnd;
+     uint32_t enter_serial;
+     uint32_t button_serial;
+     uint32_t left_button_serial;
+     uint32_t custom_move_serial;
++    uint32_t custom_resize_serial;
+     struct wayland_cursor cursor;
+     double accum_x;
+     double accum_y;
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index 3bd9877..4016aa4 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -408,28 +408,103 @@ void WAYLAND_DestroyWindow(HWND hwnd)
+     wayland_win_data_destroy(data);
+ }
+ 
++static BOOL wayland_flstudio_main_window(HWND hwnd)
++{
++    static const WCHAR main_class[] = {'T','F','r','u','i','t','y','L','o','o','p','s','M','a','i','n','F','o','r','m',0};
++    WCHAR buffer[64];
++    UNICODE_STRING name = {0, sizeof(buffer), buffer};
++    DWORD style;
++
++    if (!flstudio_compat) return FALSE;
++    style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
++    if (!(style & WS_VISIBLE) || (style & (WS_MINIMIZE | WS_MAXIMIZE))) return FALSE;
++    return NtUserGetClassName(hwnd, FALSE, &name) == ARRAY_SIZE(main_class) - 1 &&
++           !memcmp(buffer, main_class, sizeof(main_class) - sizeof(WCHAR));
++}
++
++/* FL implements border drags with SetWindowPos, including moving the origin
++ * when resizing the left/top edge. That origin does not move the Wayland
++ * toplevel, so subsequent mouse coordinates feed back into FL's calculation.
++ * Hand an actual border gesture to the compositor, once per physical press. */
++static BOOL wayland_flstudio_resize(struct wayland_win_data *data, UINT flags,
++                                    const struct window_rects *rects)
++{
++    struct wayland_surface *surface = data->wayland_surface;
++    struct wayland_pointer *pointer = &process_wayland.pointer;
++    const RECT *old = &data->rects.window, *next = &rects->window;
++    unsigned int edge = XDG_TOPLEVEL_RESIZE_EDGE_NONE, press_edges = 0;
++    int width = old->right - old->left, height = old->bottom - old->top;
++    uint32_t serial = 0;
++    POINT press;
++
++    if ((flags & (SWP_NOSIZE | SWP_SHOWWINDOW | SWP_HIDEWINDOW)) ||
++        !surface || !wayland_surface_is_toplevel(surface) || surface->resizing ||
++        (surface->processing.serial && !surface->processing.processed) ||
++        !wayland_flstudio_main_window(data->hwnd)) return FALSE;
++
++    if (width != next->right - next->left)
++    {
++        if (next->right == old->right) edge |= XDG_TOPLEVEL_RESIZE_EDGE_LEFT;
++        else if (next->left == old->left) edge |= XDG_TOPLEVEL_RESIZE_EDGE_RIGHT;
++        else return FALSE;
++    }
++    else if (next->left != old->left) return FALSE;
++    if (height != next->bottom - next->top)
++    {
++        if (next->bottom == old->bottom) edge |= XDG_TOPLEVEL_RESIZE_EDGE_TOP;
++        else if (next->top == old->top) edge |= XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM;
++        else return FALSE;
++    }
++    else if (next->top != old->top) return FALSE;
++    if (!edge) return FALSE;
++
++    pthread_mutex_lock(&pointer->mutex);
++    press.x = wl_fixed_to_double(pointer->left_button_x);
++    press.y = wl_fixed_to_double(pointer->left_button_y);
++    press = map_point_from_surface(surface, press);
++    if (press.x < 12) press_edges |= XDG_TOPLEVEL_RESIZE_EDGE_LEFT;
++    else if (press.x >= width - 12) press_edges |= XDG_TOPLEVEL_RESIZE_EDGE_RIGHT;
++    if (press.y < 12) press_edges |= XDG_TOPLEVEL_RESIZE_EDGE_TOP;
++    else if (press.y >= height - 12) press_edges |= XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM;
++    if (pointer->focused_hwnd == data->hwnd && pointer->left_button_serial &&
++        pointer->custom_resize_serial != pointer->left_button_serial &&
++        press.x >= 0 && press.y >= 0 && press.x < width && press.y < height &&
++        (press_edges & edge) == edge)
++        serial = pointer->left_button_serial;
++    if (serial)
++    {
++        pthread_mutex_lock(&process_wayland.seat.mutex);
++        if (process_wayland.seat.wl_seat)
++        {
++            pointer->custom_resize_serial = serial;
++            /* A corner's first motion may change only one dimension. */
++            edge = press_edges;
++            TRACE("hwnd=%p edge=%u serial=%u\n", data->hwnd, edge, serial);
++            xdg_toplevel_resize(surface->xdg_toplevel, process_wayland.seat.wl_seat, serial, edge);
++        }
++        else serial = 0;
++        pthread_mutex_unlock(&process_wayland.seat.mutex);
++    }
++    pthread_mutex_unlock(&pointer->mutex);
++    if (serial) wl_display_flush(process_wayland.wl_display);
++    return !!serial;
++}
++
+ /* Wayland owns the physical placement of toplevels. Keep FL's normal main
+  * window in a usable logical desktop coordinate space: FL clamps its menus
+  * to that desktop, even when its custom movement has put the parent outside
+  * it. Never change the size or normalize plugin or iconic window positions. */
+ static BOOL wayland_flstudio_main_rect(struct wayland_win_data *data, RECT *rect)
+ {
+-    static const WCHAR main_class[] = {'T','F','r','u','i','t','y','L','o','o','p','s','M','a','i','n','F','o','r','m',0};
+     struct wayland_surface *surface = data->wayland_surface;
+-    WCHAR buffer[64];
+-    UNICODE_STRING name = {0, sizeof(buffer), buffer};
+     MONITORINFO monitor = {.cbSize = sizeof(monitor)};
+     RECT desktop, effective_desktop;
+-    DWORD style;
+     UINT context;
+     BOOL monitor_valid;
+     int width, height, x, y;
+ 
+-    if (!flstudio_compat || !surface || !wayland_surface_is_toplevel(surface)) return FALSE;
+-    style = NtUserGetWindowLongW(data->hwnd, GWL_STYLE);
+-    if (!(style & WS_VISIBLE) || (style & (WS_MINIMIZE | WS_MAXIMIZE))) return FALSE;
+-    if (NtUserGetClassName(data->hwnd, FALSE, &name) != ARRAY_SIZE(main_class) - 1 ||
+-        memcmp(buffer, main_class, sizeof(main_class) - sizeof(WCHAR))) return FALSE;
++    if (!surface || !wayland_surface_is_toplevel(surface) ||
++        !wayland_flstudio_main_window(data->hwnd)) return FALSE;
+ 
+     *rect = data->rects.window;
+     desktop = NtUserGetVirtualScreenRect(MDT_RAW_DPI);
+@@ -483,7 +558,7 @@ static void wayland_flstudio_rebase_main(HWND hwnd)
+     }
+ }
+ 
+-/* FL's borderless plugin wrapper moves with SetWindowPos instead of SC_MOVE.
++/* FL's main window and plugin wrapper move with SetWindowPos instead of SC_MOVE.
+  * Only translate a position-only change during an actual left-button gesture.
+  * The existing SysCommand path handles conventional non-client drags. */
+ static BOOL wayland_flstudio_move(struct wayland_win_data *data, UINT flags,
+@@ -495,6 +570,7 @@ static BOOL wayland_flstudio_move(struct wayland_win_data *data, UINT flags,
+     WCHAR buffer[64];
+     UNICODE_STRING name = {0, sizeof(buffer), buffer};
+     uint32_t serial = 0;
++    BOOL main_window = wayland_flstudio_main_window(data->hwnd);
+ 
+     if (!flstudio_compat || (flags & (SWP_NOMOVE | SWP_HIDEWINDOW | SWP_SHOWWINDOW)) ||
+         !surface || !wayland_surface_is_toplevel(surface) ||
+@@ -503,11 +579,15 @@ static BOOL wayland_flstudio_move(struct wayland_win_data *data, UINT flags,
+         (rects->window.left == data->rects.window.left &&
+          rects->window.top == data->rects.window.top)) return FALSE;
+ 
+-    if (NtUserGetClassName(data->hwnd, FALSE, &name) != ARRAY_SIZE(plugin_class) - 1 ||
+-        memcmp(buffer, plugin_class, sizeof(plugin_class) - sizeof(WCHAR))) return FALSE;
++    if (!main_window &&
++        (NtUserGetClassName(data->hwnd, FALSE, &name) != ARRAY_SIZE(plugin_class) - 1 ||
++         memcmp(buffer, plugin_class, sizeof(plugin_class) - sizeof(WCHAR)))) return FALSE;
++    if (main_window && (data->rebasing || surface->resizing ||
++        (surface->processing.serial && !surface->processing.processed))) return FALSE;
+ 
+     pthread_mutex_lock(&pointer->mutex);
+     if (pointer->focused_hwnd == data->hwnd && pointer->left_button_serial &&
++        (!main_window || pointer->custom_resize_serial != pointer->left_button_serial) &&
+         pointer->custom_move_serial != pointer->left_button_serial)
+         serial = pointer->left_button_serial;
+     if (serial)
+@@ -538,11 +618,12 @@ BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const str
+ 
+     if (!data && !(data = wayland_win_data_create(hwnd, rects))) return FALSE;
+ 
+-    moved = wayland_flstudio_move(data, swp_flags, rects);
++    moved = wayland_flstudio_move(data, swp_flags, rects) ||
++            wayland_flstudio_resize(data, swp_flags, rects);
+     wayland_win_data_release(data);
+     if (moved)
+     {
+-        /* End FL's drag as we hand the physical gesture to the compositor.
++        /* End FL's move/resize drag as we hand the gesture to the compositor.
+          * A compositor move need not return pointer focus to this surface. */
+         INPUT input = { .type = INPUT_MOUSE, .mi.dwFlags = MOUSEEVENTF_LEFTUP };
+         NtUserSendHardwareInput(hwnd, wayland_pointer_flags, &input, 0);
+@@ -576,7 +657,8 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+ 
+     data->rects = *new_rects;
+     data->is_fullscreen = fullscreen;
+-    data->resizeable = swp_flags & WINE_SWP_RESIZABLE;
++    /* FL's borderless main window has custom resize grips without WS_THICKFRAME. */
++    data->resizeable = (swp_flags & WINE_SWP_RESIZABLE) || wayland_flstudio_main_window(hwnd);
+     data->managed = managed;
+ 
+     if (!surface)
+-- 
+2.55.0
+

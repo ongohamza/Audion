@@ -21,17 +21,18 @@ typedef struct { unsigned short Length,MaximumLength; WCHAR *Buffer; } UNICODE_S
 #define SWP_SHOWWINDOW 64
 struct rect { int left,top,right,bottom; };
 struct window_rects { struct rect window; };
-struct wayland_surface { void *xdg_toplevel; };
-struct wayland_win_data { HWND hwnd; struct wayland_surface *wayland_surface; struct window_rects rects; };
-struct wayland_pointer { pthread_mutex_t mutex; HWND focused_hwnd,custom_move_hwnd; uint32_t left_button_serial,custom_move_serial; };
+struct wayland_surface { void *xdg_toplevel; BOOL resizing; struct {unsigned serial;BOOL processed;} processing; };
+struct wayland_win_data { HWND hwnd; struct wayland_surface *wayland_surface; struct window_rects rects; BOOL rebasing; };
+struct wayland_pointer { pthread_mutex_t mutex; HWND focused_hwnd,custom_move_hwnd; uint32_t left_button_serial,custom_move_serial,custom_resize_serial; };
 static struct { struct wayland_pointer pointer; struct { pthread_mutex_t mutex; void *wl_seat; } seat; void *wl_display; } process_wayland;
 static BOOL flstudio_compat;
 static int moves,flushes,other_class;
+static BOOL wayland_flstudio_main_window(HWND h) { return flstudio_compat && other_class==2; }
 static BOOL wayland_surface_is_toplevel(struct wayland_surface *s) { return !!s->xdg_toplevel; }
 static int NtUserGetClassName(HWND h, BOOL real, UNICODE_STRING *name)
 {
  /* Wine's actual function returns length; it does NOT assign name->Length. */
- const char *s=other_class?"OtherForm":"TPluginForm"; int i;
+ const char *s=other_class==2?"TFruityLoopsMainForm":other_class?"OtherForm":"TPluginForm"; int i;
  for(i=0;s[i];i++) name->Buffer[i]=s[i]; name->Buffer[i]=0; return i;
 }
 static void xdg_toplevel_move(void *surface,void *seat,uint32_t serial) { assert(surface&&seat&&serial); moves++; }
@@ -59,7 +60,16 @@ int main(void)
  wayland_flstudio_move(&data,0x14,&next); assert(moves==1); /* once per press */
  process_wayland.pointer.left_button_serial=11;
  wayland_flstudio_move(&data,0x14,&next); assert(moves==2); /* second drag */
- puts("PASS: opt-in, class, sizing, visibility, button state, and one request per gesture");
+ other_class=2;process_wayland.pointer.left_button_serial=12;
+ assert(wayland_flstudio_move(&data,0x815,&next)&&moves==3); /* main drag */
+ process_wayland.pointer.left_button_serial=13;data.rebasing=1;
+ assert(!wayland_flstudio_move(&data,0x815,&next)&&moves==3);data.rebasing=0;
+ surface.resizing=1;assert(!wayland_flstudio_move(&data,0x815,&next));surface.resizing=0;
+ process_wayland.pointer.custom_resize_serial=13;
+ assert(!wayland_flstudio_move(&data,0x815,&next));
+ process_wayland.pointer.left_button_serial=14;
+ assert(wayland_flstudio_move(&data,0x815,&next)&&moves==4);
+ puts("PASS: main/plugin movement, resize/rebase exclusion, opt-in, class, sizing, visibility, button state, and one request per gesture");
 }
 '''
 with tempfile.TemporaryDirectory() as d:

@@ -10,6 +10,7 @@ The Wine 11.18 build includes these patches by default:
 
 5. `patches/wayland/0005-restore-minimized-windows-and-import-file-drops.patch`: restore minimized windows when the compositor reactivates them, including FL's iconic window geometry, and import local file drops from Dolphin/desktop through Windows drag-and-drop handling.
 6. `patches/wayland/0006-keep-main-window-menu-coordinates-on-desktop.patch`: keep the normal main window's logical origin inside the desktop so FL's dropdown placement remains consistent after moving/resizing.
+7. `patches/wayland/0007-handle-main-window-custom-move-and-resize.patch`: translate FL main-window border resizing and custom movement into compositor gestures, preserving corner resizing and the menu-coordinate fix.
 
 Use the [Wine + Audion + PipeASIO build instructions](BUILD_WINE_11.18.md). The manifest includes all five patches for both fresh and updated builds. Source patching and compilation alone do not update installed Wine. The installer refuses to replace a running Wine session.
 
@@ -27,7 +28,7 @@ The framework explanation is based on [JUCE's Windows peer implementation](https
 
 The coordinate regression reproduces the gap on the preceding patch set: pointer coordinates and child click delivery pass, but out-of-desktop `WindowFromPoint` returns NULL. The updated test also checks no-window results, cursor clip/reset/release behavior, and restoration of ordinary desktop-bound hit tests. See the [verification record](verification/2026-09-29-wayland-input.md).
 
-The wrapper move translation applies to `TPluginForm` during a physical left-button gesture and sends one compositor move request per press. Custom resizing is not implemented by this patch. Compositor-rejected moves, multiple monitors, fractional scaling, bridged plugins, keyboard text entry and every third-party plugin have not all been validated. This work addresses the identified shared failures; it is not a guarantee that every plugin UI is fully compatible with Wine Wayland.
+The wrapper move translation applies to `TPluginForm` during a physical left-button gesture and sends one compositor move request per press. That first patch does not implement custom resizing; the seventh patch adds main-window resizing. Compositor-rejected moves, multiple monitors, fractional scaling, bridged plugins, keyboard text entry and every third-party plugin have not all been validated. This work addresses the identified shared failures; it is not a guarantee that every plugin UI is fully compatible with Wine Wayland.
 
 No audio callback, PipeASIO code, background polling loop, scheduler policy, or kernel setting is changed. Configuration is read once at process initialization. Keep verbose tracing off for audio work. Realtime audio performance must be measured with the same project, device, sample rate and buffer size before/after. The development host used ntsync and a dynamically preemptible CachyOS BORE kernel; PREEMPT_RT performance is unmeasured.
 
@@ -90,3 +91,24 @@ The correction also skips cases that would turn a normal window fullscreen or
 where raw and emulated virtual desktop bounds differ. This is a focused repair
 for fitting normal FL main windows, not general placement support for every
 window/layout. See the [verification record](verification/2026-09-29-wayland-main-menu-coordinates.md).
+
+## Main-window movement and resizing
+
+FL's borderless main window resizes by changing its Windows rectangle directly.
+Under native Wayland, changing that logical origin does not move the native
+surface. Dragging the left/top edge can therefore feed incorrect coordinates
+back into FL's next size calculation and make the window shrink or grow
+incorrectly.
+
+The seventh patch hands actual main-window border gestures to the compositor.
+It remembers the physical press location, verifies the changed edge, and sends
+one native resize request per press. Corners retain both axes even when the
+first motion changes only one dimension. The normal borderless main window is
+advertised as resizeable. Ordinary programmatic resizes and other window
+classes do not use this handoff.
+
+Main-window movement also uses the existing plugin-move handoff. Corrective
+menu-position changes and active compositor resizes cannot start a main-window
+move. FL's own drag is ended using the same synthetic release already used for
+plugin movement. The user confirmed that main movement, resizing and menus
+work together. See the [verification record](verification/2026-09-29-wayland-main-window-resize.md).
