@@ -9,6 +9,7 @@ The Wine 11.18 build includes these patches by default:
 4. `patches/wayland/0004-release-desktop-pointer-confinement.patch`: release desktop-wide native pointer confinement for visible FL plugin cursors, while retaining hidden-cursor knob input and narrower clips. Automatic fullscreen clipping also preserves the driver's logical coordinates.
 
 5. `patches/wayland/0005-restore-minimized-windows-and-import-file-drops.patch`: restore minimized windows when the compositor reactivates them, including FL's iconic window geometry, and import local file drops from Dolphin/desktop through Windows drag-and-drop handling.
+6. `patches/wayland/0006-keep-main-window-menu-coordinates-on-desktop.patch`: keep the normal main window's logical origin inside the desktop so FL's dropdown placement remains consistent after moving/resizing.
 
 Use the [Wine + Audion + PipeASIO build instructions](BUILD_WINE_11.18.md). The manifest includes all five patches for both fresh and updated builds. Source patching and compilation alone do not update installed Wine. The installer refuses to replace a running Wine session.
 
@@ -68,3 +69,24 @@ The worker waits when idle and does not poll or change thread priorities.
 This adds incoming local-file copies, not outgoing drags, remote downloads or
 OLE hover previews. Existing clipboard handling is preserved. See the
 [verification record](verification/2026-09-29-wayland-restore-file-drops.md).
+
+## Main menus after resizing
+
+The sixth patch addresses a separately reproduced dropdown-placement failure.
+FL's custom movement can leave the main window's Windows coordinates outside
+Wine's virtual desktop while the Wayland compositor still displays it. FL then
+clamps its dropdown into the desktop and Wine places that popup far away from
+its visible parent.
+
+Under the existing automatic FL compatibility, the driver corrects the logical
+origin of a normal visible `TFruityLoopsMainForm` after movement or resizing.
+It preserves the size and lets Win32 update child coordinates. Native placement
+remains controlled by the compositor; this does not recover global Wayland
+window coordinates. Cached surface-local input is reprojected so a stationary
+pointer remains accurate, including when an old motion frame is still queued.
+
+Plugin, hidden, minimized, maximized and oversized windows keep their positions.
+The correction also skips cases that would turn a normal window fullscreen or
+where raw and emulated virtual desktop bounds differ. This is a focused repair
+for fitting normal FL main windows, not general placement support for every
+window/layout. See the [verification record](verification/2026-09-29-wayland-main-menu-coordinates.md).

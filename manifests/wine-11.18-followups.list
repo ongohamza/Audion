@@ -9,3 +9,4 @@ patches/nexus-rendering/0004-present-opaque-nexus-frames-on-gpu.patch
 patches/nexus-rendering/0005-index-path-intersections-and-fill-tests.patch
 patches/wayland/0004-release-desktop-pointer-confinement.patch
 patches/wayland/0005-restore-minimized-windows-and-import-file-drops.patch
+patches/wayland/0006-keep-main-window-menu-coordinates-on-desktop.patch

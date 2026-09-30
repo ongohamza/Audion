@@ -1,0 +1,298 @@
+From 1b1967ac1561a623eaf03c1ee3db8df5b61e8b59 Mon Sep 17 00:00:00 2001
+From: ongohamza <hkhamzash773@gmail.com>
+Date: Tue, 29 Sep 2026 22:15:03 -0700
+Subject: [PATCH] winewayland: Keep FL main menu coordinates inside the logical
+ desktop
+
+---
+ dlls/winewayland.drv/wayland_pointer.c | 69 ++++++++++++++++++++--
+ dlls/winewayland.drv/waylanddrv.h      |  6 ++
+ dlls/winewayland.drv/window.c          | 81 ++++++++++++++++++++++++++
+ 3 files changed, 150 insertions(+), 6 deletions(-)
+
+diff --git a/dlls/winewayland.drv/wayland_pointer.c b/dlls/winewayland.drv/wayland_pointer.c
+index 542690b..9f15b66 100644
+--- a/dlls/winewayland.drv/wayland_pointer.c
++++ b/dlls/winewayland.drv/wayland_pointer.c
+@@ -122,25 +122,37 @@ static HWND wayland_pointer_get_focused_hwnd(void)
+     return hwnd;
+ }
+ 
+-static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy)
++static void pointer_send_absolute_motion(HWND hwnd, BOOL refresh)
+ {
++    struct wayland_pointer *pointer = &process_wayland.pointer;
++    wl_fixed_t sx, sy;
+     INPUT input = {0};
+     RECT *window_rect;
+-    HWND hwnd;
+-    POINT screen = { wl_fixed_to_double(sx), wl_fixed_to_double(sy) };
++    POINT screen;
+     struct wayland_surface *surface;
+     struct wayland_win_data *data;
+ 
+-    if (!(hwnd = wayland_pointer_get_focused_hwnd())) return;
+-    if (!(data = wayland_win_data_get(hwnd))) return;
++    if (!hwnd || !(data = wayland_win_data_get(hwnd))) return;
+     if (!(surface = data->wayland_surface))
+     {
+         wayland_win_data_release(data);
+         return;
+     }
+ 
+-    window_rect = &surface->window.rect;
++    pthread_mutex_lock(&pointer->mutex);
++    if (pointer->focused_hwnd != hwnd || (refresh && pointer->relative_mode))
++    {
++        pthread_mutex_unlock(&pointer->mutex);
++        wayland_win_data_release(data);
++        return;
++    }
++    sx = pointer->surface_x;
++    sy = pointer->surface_y;
++    pthread_mutex_unlock(&pointer->mutex);
+ 
++    window_rect = &surface->window.rect;
++    screen.x = wl_fixed_to_double(sx);
++    screen.y = wl_fixed_to_double(sy);
+     screen = map_point_from_surface(surface, screen);
+     screen.x += window_rect->left;
+     screen.y += window_rect->top;
+@@ -157,6 +169,9 @@ static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy)
+     input.mi.dx = screen.x;
+     input.mi.dy = screen.y;
+     input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
++    /* Rebase runs on the window thread, whose accumulated motion will not be
++     * flushed by wl_pointer.frame on the Wayland event thread. */
++    if (refresh) input.mi.dwFlags |= MOUSEEVENTF_MOVE_NOCOALESCE;
+ 
+     TRACE("hwnd=%p wayland_xy=%.2f,%.2f screen_xy=%d,%d\n",
+           hwnd, wl_fixed_to_double(sx), wl_fixed_to_double(sy),
+@@ -165,6 +180,43 @@ static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy)
+     NtUserSendHardwareInput(hwnd, wayland_pointer_flags, &input, 0);
+ }
+ 
++void wayland_pointer_refresh_position(HWND hwnd)
++{
++    struct wayland_pointer *pointer = &process_wayland.pointer;
++
++    pthread_mutex_lock(&pointer->mutex);
++    if (pointer->focused_hwnd == hwnd && !pointer->relative_mode) pointer->refresh_hwnd = hwnd;
++    pthread_mutex_unlock(&pointer->mutex);
++    pointer_send_absolute_motion(hwnd, TRUE);
++}
++
++/* A frame already accumulated on the event thread may still contain the old
++ * origin. Reproject after flushing it, or before a button consumes its position. */
++static void pointer_refresh_pending(void)
++{
++    struct wayland_pointer *pointer = &process_wayland.pointer;
++    HWND hwnd;
++
++    pthread_mutex_lock(&pointer->mutex);
++    hwnd = pointer->refresh_hwnd;
++    pointer->refresh_hwnd = NULL;
++    pthread_mutex_unlock(&pointer->mutex);
++    if (hwnd) pointer_send_absolute_motion(hwnd, TRUE);
++}
++
++static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy)
++{
++    struct wayland_pointer *pointer = &process_wayland.pointer;
++    HWND hwnd;
++
++    pthread_mutex_lock(&pointer->mutex);
++    pointer->surface_x = sx;
++    pointer->surface_y = sy;
++    hwnd = pointer->focused_hwnd;
++    pthread_mutex_unlock(&pointer->mutex);
++    pointer_send_absolute_motion(hwnd, FALSE);
++}
++
+ static void pointer_handle_motion(void *data, struct wl_pointer *wl_pointer,
+                                   uint32_t time, wl_fixed_t sx, wl_fixed_t sy)
+ {
+@@ -196,6 +248,8 @@ static void pointer_handle_enter(void *data, struct wl_pointer *wl_pointer,
+ 
+     pthread_mutex_lock(&pointer->mutex);
+     pointer->focused_hwnd = hwnd;
++    pointer->surface_x = sx;
++    pointer->surface_y = sy;
+     pointer->enter_serial = serial;
+     pthread_mutex_unlock(&pointer->mutex);
+ 
+@@ -272,6 +326,7 @@ static void pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
+ 
+     TRACE("hwnd=%p button=%#x state=%u\n", hwnd, button, state);
+ 
++    pointer_refresh_pending();
+     NtUserSendHardwareInput(hwnd, wayland_pointer_flags, &input, 0);
+ }
+ 
+@@ -284,6 +339,7 @@ static void pointer_handle_frame(void *data, struct wl_pointer *wl_pointer)
+ {
+     static const INPUT input = { .type = INPUT_MOUSE, .mi.dwFlags = MOUSEEVENTF_MOVE_NOCOALESCE };
+     NtUserSendHardwareInput(NULL, wayland_pointer_flags, &input, 0); /* flush win32u accumulated motion */
++    pointer_refresh_pending();
+ }
+ 
+ static void pointer_handle_axis_source(void *data, struct wl_pointer *wl_pointer,
+@@ -321,6 +377,7 @@ static void pointer_handle_axis_value120(void *data, struct wl_pointer *wl_point
+ 
+     TRACE("hwnd=%p axis=%u value120=%d\n", hwnd, axis, value120);
+ 
++    pointer_refresh_pending();
+     NtUserSendHardwareInput(hwnd, wayland_pointer_flags, &input, 0);
+ }
+ 
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index 0f6bec2..661b3cb 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -74,6 +74,7 @@ enum wayland_window_message
+     WM_WAYLAND_CONFIGURE,
+     WM_WAYLAND_SET_FOREGROUND,
+     WM_WAYLAND_DROP_FILES,
++    WM_WAYLAND_REBASE_MAIN,
+ };
+ 
+ enum wayland_surface_config_state
+@@ -119,6 +120,8 @@ struct wayland_pointer
+     HWND constraint_hwnd;
+     BOOL relative_mode;
+     BOOL pending_warp;
++    wl_fixed_t surface_x, surface_y;
++    HWND refresh_hwnd;
+     uint32_t enter_serial;
+     uint32_t button_serial;
+     uint32_t left_button_serial;
+@@ -387,10 +390,13 @@ struct wayland_win_data
+     BOOL resizeable;
+     BOOL managed;
+     BOOL layered_attribs_set;
++    BOOL rebase_pending;
++    BOOL rebasing;
+ };
+ 
+ struct wayland_win_data *wayland_win_data_get(HWND hwnd);
+ void wayland_win_data_release(struct wayland_win_data *data);
++void wayland_pointer_refresh_position(HWND hwnd);
+ 
+ struct wayland_client_surface *get_client_surface(HWND hwnd);
+ void set_client_surface(HWND hwnd, struct wayland_client_surface *client);
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index e33a8de..3bd9877 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -408,6 +408,81 @@ void WAYLAND_DestroyWindow(HWND hwnd)
+     wayland_win_data_destroy(data);
+ }
+ 
++/* Wayland owns the physical placement of toplevels. Keep FL's normal main
++ * window in a usable logical desktop coordinate space: FL clamps its menus
++ * to that desktop, even when its custom movement has put the parent outside
++ * it. Never change the size or normalize plugin or iconic window positions. */
++static BOOL wayland_flstudio_main_rect(struct wayland_win_data *data, RECT *rect)
++{
++    static const WCHAR main_class[] = {'T','F','r','u','i','t','y','L','o','o','p','s','M','a','i','n','F','o','r','m',0};
++    struct wayland_surface *surface = data->wayland_surface;
++    WCHAR buffer[64];
++    UNICODE_STRING name = {0, sizeof(buffer), buffer};
++    MONITORINFO monitor = {.cbSize = sizeof(monitor)};
++    RECT desktop, effective_desktop;
++    DWORD style;
++    UINT context;
++    BOOL monitor_valid;
++    int width, height, x, y;
++
++    if (!flstudio_compat || !surface || !wayland_surface_is_toplevel(surface)) return FALSE;
++    style = NtUserGetWindowLongW(data->hwnd, GWL_STYLE);
++    if (!(style & WS_VISIBLE) || (style & (WS_MINIMIZE | WS_MAXIMIZE))) return FALSE;
++    if (NtUserGetClassName(data->hwnd, FALSE, &name) != ARRAY_SIZE(main_class) - 1 ||
++        memcmp(buffer, main_class, sizeof(main_class) - sizeof(WCHAR))) return FALSE;
++
++    *rect = data->rects.window;
++    desktop = NtUserGetVirtualScreenRect(MDT_RAW_DPI);
++    width = rect->right - rect->left;
++    height = rect->bottom - rect->top;
++    /* Oversized windows cannot fit without resizing; leave their policy to FL. */
++    if (width <= 0 || height <= 0 || width > desktop.right - desktop.left ||
++        height > desktop.bottom - desktop.top) return FALSE;
++    x = max(desktop.left, min(rect->left, desktop.right - width));
++    y = max(desktop.top, min(rect->top, desktop.bottom - height));
++    if (x == rect->left && y == rect->top) return FALSE;
++    OffsetRect(rect, x - rect->left, y - rect->top);
++
++    /* A position-only change can otherwise turn a borderless window into a
++     * fullscreen window in win32u. Do not introduce a native state change. */
++    context = NtUserSetThreadDpiAwarenessContext(NTUSER_DPI_PER_MONITOR_AWARE);
++    effective_desktop = NtUserGetVirtualScreenRect(MDT_DEFAULT);
++    monitor_valid = NtUserGetMonitorInfo(NtUserMonitorFromRect(rect, MONITOR_DEFAULTTONEAREST), &monitor);
++    NtUserSetThreadDpiAwarenessContext(context);
++    /* Display-mode emulation uses a different coordinate transform. */
++    if (!EqualRect(&desktop, &effective_desktop) || !monitor_valid ||
++        (rect->left <= monitor.rcMonitor.left && rect->right >= monitor.rcMonitor.right &&
++         rect->top <= monitor.rcMonitor.top && rect->bottom >= monitor.rcMonitor.bottom)) return FALSE;
++    return TRUE;
++}
++
++static void wayland_flstudio_rebase_main(HWND hwnd)
++{
++    struct wayland_win_data *data;
++    RECT rect;
++
++    if (!(data = wayland_win_data_get(hwnd))) return;
++    data->rebase_pending = FALSE;
++    if (data->rebasing || !wayland_flstudio_main_rect(data, &rect))
++    {
++        wayland_win_data_release(data);
++        return;
++    }
++    data->rebasing = TRUE;
++    wayland_win_data_release(data);
++
++    TRACE("rebasing main hwnd %p to %s\n", hwnd, wine_dbgstr_rect(&rect));
++    NtUserSetRawWindowPos(hwnd, rect, SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER |
++                          SWP_NOOWNERZORDER | SWP_NOSENDCHANGING, FALSE);
++    /* The compositor need not send motion when only the logical origin changed. */
++    wayland_pointer_refresh_position(hwnd);
++    if ((data = wayland_win_data_get(hwnd)))
++    {
++        data->rebasing = FALSE;
++        wayland_win_data_release(data);
++    }
++}
++
+ /* FL's borderless plugin wrapper moves with SetWindowPos instead of SC_MOVE.
+  * Only translate a position-only change during an actual left-button gesture.
+  * The existing SysCommand path handles conventional non-client drags. */
+@@ -486,6 +561,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+     struct wayland_surface *owner_surface;
+     struct wayland_win_data *data, *owner_data;
+     BOOL managed, fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
++    RECT main_rect;
+ 
+     TRACE("hwnd %p new_rects %s after %p flags %08x\n", hwnd, debugstr_window_rects(new_rects), insert_after, swp_flags);
+ 
+@@ -517,6 +593,8 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+     }
+ 
+     if (owner_data) wayland_win_data_release(owner_data);
++    if (!data->rebasing && !data->rebase_pending && wayland_flstudio_main_rect(data, &main_rect))
++        data->rebase_pending = NtUserPostMessage(hwnd, WM_WAYLAND_REBASE_MAIN, 0, 0);
+     wayland_win_data_release(data);
+ }
+ 
+@@ -669,6 +747,9 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+         return 0;
+     case WM_WAYLAND_DROP_FILES:
+         return wayland_drop_files(hwnd, wp);
++    case WM_WAYLAND_REBASE_MAIN:
++        wayland_flstudio_rebase_main(hwnd);
++        return 0;
+     case WM_WAYLAND_SET_FOREGROUND:
+         NtUserSetForegroundWindowInternal(hwnd);
+         return 0;
+-- 
+2.55.0
+
