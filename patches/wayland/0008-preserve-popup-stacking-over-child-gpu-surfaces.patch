@@ -1,0 +1,30 @@
+From fec45e762340d6339fc67aaacf57dc107d8148aa Mon Sep 17 00:00:00 2001
+From: ongohamza <hkhamzash773@gmail.com>
+Date: Thu, 1 Oct 2026 00:02:59 -0700
+Subject: [PATCH] winewayland: Preserve popup stacking when updating geometry
+
+---
+ dlls/winewayland.drv/wayland_surface.c | 7 +++----
+ 1 file changed, 3 insertions(+), 4 deletions(-)
+
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 52a6c66..3d932db 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -791,10 +791,9 @@ static void wayland_surface_reconfigure_subsurface(struct wayland_surface *surfa
+         TRACE("hwnd=%p rect=%s\n", surface->hwnd, wine_dbgstr_rect(&rect));
+ 
+         wl_subsurface_set_position(surface->wl_subsurface, rect.left, rect.top);
+-        if (owner_data->client_surface && owner_data->client_surface->wl_subsurface)
+-            wl_subsurface_place_above(surface->wl_subsurface, owner_data->client_surface->wl_surface);
+-        else
+-            wl_subsurface_place_above(surface->wl_subsurface, owner_surface->wl_surface);
++        /* New subsurfaces start above their siblings. Preserve that order when
++         * updating geometry: placing this surface immediately above its parent
++         * can hide it behind GPU clients belonging to child HWNDs. */
+         wl_surface_commit(owner_surface->wl_surface);
+ 
+         memset(&surface->processing, 0, sizeof(surface->processing));
+-- 
+2.55.0
+

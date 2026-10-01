@@ -11,3 +11,4 @@ patches/wayland/0004-release-desktop-pointer-confinement.patch
 patches/wayland/0005-restore-minimized-windows-and-import-file-drops.patch
 patches/wayland/0006-keep-main-window-menu-coordinates-on-desktop.patch
 patches/wayland/0007-handle-main-window-custom-move-and-resize.patch
+patches/wayland/0008-preserve-popup-stacking-over-child-gpu-surfaces.patch

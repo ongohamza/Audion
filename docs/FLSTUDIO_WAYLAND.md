@@ -11,6 +11,7 @@ The Wine 11.18 build includes these patches by default:
 5. `patches/wayland/0005-restore-minimized-windows-and-import-file-drops.patch`: restore minimized windows when the compositor reactivates them, including FL's iconic window geometry, and import local file drops from Dolphin/desktop through Windows drag-and-drop handling.
 6. `patches/wayland/0006-keep-main-window-menu-coordinates-on-desktop.patch`: keep the normal main window's logical origin inside the desktop so FL's dropdown placement remains consistent after moving/resizing.
 7. `patches/wayland/0007-handle-main-window-custom-move-and-resize.patch`: translate FL main-window border resizing and custom movement into compositor gestures, preserving corner resizing and the menu-coordinate fix.
+8. `patches/wayland/0008-preserve-popup-stacking-over-child-gpu-surfaces.patch`: preserve popup stacking above GPU-rendered child windows, fixing Serum 2 preset menus.
 
 Use the [Wine + Audion + PipeASIO build instructions](BUILD_WINE_11.18.md). The manifest includes all five patches for both fresh and updated builds. Source patching and compilation alone do not update installed Wine. The installer refuses to replace a running Wine session.
 
@@ -112,3 +113,13 @@ menu-position changes and active compositor resizes cannot start a main-window
 move. FL's own drag is ended using the same synthetic release already used for
 plugin movement. The user confirmed that main movement, resizing and menus
 work together. See the [verification record](verification/2026-09-29-wayland-main-window-resize.md).
+
+## Serum 2 preset menus
+
+Popup geometry updates previously lowered Serum's menu beneath its GPU editor
+when that editor belonged to a child HWND. The driver now preserves the native
+stacking order established when the menu subsurface is created. Nested menus
+remain above earlier menus, and the GPU clients retain their relative order.
+This applies by default without a Serum-specific setting and adds no per-frame
+work. The user confirmed rendering and preset selection. See the
+[verification record](verification/2026-10-01-wayland-serum-popup-stacking.md).
